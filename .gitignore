@@ -1,0 +1,7 @@
+/target
+target/
+uploads/
+jsecure-cloud.db
+*.sqlite3
+*.log
+

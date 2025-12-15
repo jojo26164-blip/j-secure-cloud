@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+content-type: application/octet-stream
+content-disposition: attachment; filename="test.txt"
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-credentials: true
+transfer-encoding: chunked
+date: Mon, 15 Dec 2025 00:39:55 GMT
+
+hello

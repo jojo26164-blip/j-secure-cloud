@@ -1,0 +1,392 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>J-Secure Cloud – Dashboard</title>
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#020617;color:#e5e7eb;display:flex;justify-content:center;align-items:center;min-height:100vh}
+    .card{background:#0f172a;padding:24px 28px;border-radius:16px;box-shadow:0 20px 40px rgba(0,0,0,.45);width:min(980px,95vw)}
+    h1{margin:0 0 4px;font-size:24px}
+    .subtitle{font-size:12px;color:#9ca3af;margin-bottom:16px}
+    .grid{display:grid;grid-template-columns:1.2fr 1.2fr 1.6fr;gap:18px}
+    .panel{background:#020617;border-radius:12px;padding:14px 16px;border:1px solid #1e293b;display:flex;flex-direction:column;gap:8px}
+    h2{margin:0 0 6px;font-size:16px}
+    label{font-size:12px;color:#9ca3af}
+    input[type="email"],input[type="password"],input[type="file"],input[type="text"]{
+      width:100%;margin-top:2px;padding:8px 10px;border-radius:10px;border:1px solid #1e293b;background:#020617;color:#e5e7eb;font-size:13px;outline:none
+    }
+    input[type="file"]{padding:6px}
+    .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .btn{border:none;border-radius:999px;padding:7px 12px;font-size:13px;cursor:pointer}
+    .btn-primary{background:#22c55e;color:#022c22;font-weight:700}
+    .btn-secondary{background:#1f2937;color:#e5e7eb}
+    .btn-danger{background:#ef4444;color:#1f2937;font-weight:700}
+    .status{font-size:12px;margin-top:4px;color:#9ca3af}
+    .ok{color:#22c55e}
+    .error{color:#f97373}
+    code{background:#0b1220;border:1px solid #1e293b;padding:2px 6px;border-radius:8px}
+    table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+    th,td{padding:6px 6px;border-bottom:1px solid #111827;text-align:left;vertical-align:top}
+    th{font-weight:700;color:#9ca3af}
+    .files-header{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
+    .small{font-size:11px;color:#94a3b8}
+    .pill{display:inline-block;padding:2px 8px;border-radius:999px;border:1px solid #1e293b;background:#0b1220;color:#9ca3af;font-size:11px}
+    .tokenbox{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:11px;word-break:break-all;background:#0b1220;border:1px solid #1e293b;border-radius:10px;padding:8px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>J-Secure Cloud</h1>
+    <div class="subtitle">
+      Dashboard local (offline) — API : <code id="apiLabel"></code>
+      <span class="pill" id="healthPill">health: ?</span>
+    </div>
+
+    <div class="grid">
+      <!-- Connexion -->
+      <div class="panel">
+        <h2>1) Auth</h2>
+
+        <label>API Base (optionnel)</label>
+        <input id="apiBase" type="text" placeholder="https://rust.jdoukh.org/" />
+
+        <div class="row">
+          <div style="flex:1;min-width:220px">
+            <label for="email">Email</label>
+            <input id="email" type="email" value="jojo@example.com" />
+          </div>
+          <div style="flex:1;min-width:220px">
+            <label for="password">Mot de passe</label>
+            <input id="password" type="password" value="azerty123" />
+          </div>
+        </div>
+
+        <div class="row" style="margin-top:6px">
+          <button class="btn btn-secondary" onclick="registerUser()">Register</button>
+          <button class="btn btn-primary" onclick="login()">Login</button>
+          <button class="btn btn-secondary" onclick="logout()">Logout</button>
+        </div>
+
+        <div id="authStatus" class="status">Statut : déconnecté</div>
+        <div class="small">Token (si connecté) :</div>
+        <div id="tokenBox" class="tokenbox">—</div>
+      </div>
+
+      <!-- Upload -->
+      <div class="panel">
+        <h2>2) Upload</h2>
+        <label for="fileInput">Choisir un fichier</label>
+        <input id="fileInput" type="file" />
+        <div class="row" style="margin-top:8px">
+          <button class="btn btn-secondary" onclick="uploadFile()">Upload</button>
+        </div>
+        <div id="uploadStatus" class="status">En attente…</div>
+      </div>
+
+      <!-- Liste fichiers -->
+      <div class="panel">
+        <div class="files-header">
+          <h2>3) Fichiers</h2>
+          <div class="row">
+            <button class="btn btn-secondary" onclick="refreshFiles()">Rafraîchir</button>
+          </div>
+        </div>
+        <div id="filesStatus" class="status">Aucun fichier chargé.</div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Nom</th>
+              <th>Taille</th>
+              <th>Créé le</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="filesBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+<script>
+/** =========================
+ * CONFIG
+ * ========================= */
+let TOKEN = null;
+
+// ✅ Par défaut on vise ton domaine en reverse proxy :
+const DEFAULT_API_BASE = "/api";
+
+function getApiBase() {
+  const v = (document.getElementById("apiBase").value || "").trim();
+  return v ? v.replace(/\/+$/,'') : DEFAULT_API_BASE;
+}
+
+function setStatus(id, text, type) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = text;
+  el.classList.remove("ok","error");
+  if (type === "ok") el.classList.add("ok");
+  if (type === "error") el.classList.add("error");
+}
+
+function setTokenBox() {
+  document.getElementById("tokenBox").textContent = TOKEN ? TOKEN : "—";
+}
+
+async function apiHealth() {
+  const base = getApiBase();
+  document.getElementById("apiLabel").textContent = base;
+
+  try {
+    const res = await fetch(base + "/health", { method: "GET" });
+    if (!res.ok) {
+      document.getElementById("healthPill").textContent = "health: " + res.status;
+      return;
+    }
+    document.getElementById("healthPill").textContent = "health: OK";
+  } catch (e) {
+    document.getElementById("healthPill").textContent = "health: offline";
+  }
+}
+
+/** =========================
+ * AUTH
+ * ========================= */
+async function registerUser() {
+  const base = getApiBase();
+  const email = document.getElementById("email").value.trim();
+  const password = document.getElementById("password").value.trim();
+  setStatus("authStatus", "Register en cours…", "info");
+
+  try {
+    const res = await fetch(base + "/auth/register", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+
+    const txt = await res.text();
+    if (!res.ok) {
+      setStatus("authStatus", "Register erreur: " + res.status + " — " + txt, "error");
+      return;
+    }
+    setStatus("authStatus", "Register OK ✅", "ok");
+  } catch (e) {
+    console.error(e);
+    setStatus("authStatus", "Register erreur réseau", "error");
+  }
+}
+
+async function login() {
+  const base = getApiBase();
+  const email = document.getElementById("email").value.trim();
+  const password = document.getElementById("password").value.trim();
+
+  setStatus("authStatus", "Login en cours…", "info");
+
+  try {
+    const res = await fetch(base + "/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password })
+    });
+
+    const data = await res.json().catch(async () => ({ _raw: await res.text() }));
+    if (!res.ok) {
+      setStatus("authStatus", "Login erreur: " + res.status + " — " + JSON.stringify(data), "error");
+      TOKEN = null;
+      setTokenBox();
+      return;
+    }
+
+    TOKEN = data.token || null;
+    setTokenBox();
+    setStatus("authStatus", TOKEN ? "Connecté ✅ (token reçu)" : "Connecté (mais pas de token ?)", TOKEN ? "ok" : "error");
+    await refreshFiles();
+  } catch (e) {
+    console.error(e);
+    setStatus("authStatus", "Login erreur réseau", "error");
+  }
+}
+
+function logout() {
+  TOKEN = null;
+  setTokenBox();
+  document.getElementById("filesBody").innerHTML = "";
+  setStatus("authStatus", "Déconnecté", "info");
+  setStatus("filesStatus", "Non connecté", "error");
+}
+
+/** =========================
+ * FILES
+ * ========================= */
+async function refreshFiles() {
+  const base = getApiBase();
+  if (!TOKEN) {
+    setStatus("filesStatus", "Non connecté", "error");
+    return;
+  }
+
+  setStatus("filesStatus", "Chargement…", "info");
+  try {
+    const res = await fetch(base + "/files", {
+      headers: { "Authorization": "Bearer " + TOKEN }
+    });
+
+    const data = await res.json().catch(async () => ({ _raw: await res.text() }));
+    if (!res.ok) {
+      setStatus("filesStatus", "Erreur list: " + res.status + " — " + JSON.stringify(data), "error");
+      return;
+    }
+
+    const files = data;
+    const tbody = document.getElementById("filesBody");
+    tbody.innerHTML = "";
+
+    if (!Array.isArray(files) || files.length === 0) {
+      setStatus("filesStatus", "Aucun fichier", "info");
+      return;
+    }
+
+    for (const f of files) {
+      const tr = document.createElement("tr");
+
+      const tdId = document.createElement("td");
+      tdId.textContent = f.id;
+      tr.appendChild(tdId);
+
+      const tdName = document.createElement("td");
+      tdName.textContent = f.filename || "";
+      tr.appendChild(tdName);
+
+      const tdSize = document.createElement("td");
+      tdSize.textContent = (f.size_bytes ?? 0) + " octets";
+      tr.appendChild(tdSize);
+
+      const tdDate = document.createElement("td");
+      tdDate.textContent = f.created_at || "";
+      tr.appendChild(tdDate);
+
+      const tdActions = document.createElement("td");
+
+      const btnDl = document.createElement("button");
+      btnDl.textContent = "Télécharger";
+      btnDl.className = "btn btn-secondary";
+      btnDl.onclick = () => downloadFile(f.id, f.filename);
+      tdActions.appendChild(btnDl);
+
+      const btnDel = document.createElement("button");
+      btnDel.textContent = "Supprimer";
+      btnDel.className = "btn btn-danger";
+      btnDel.style.marginLeft = "8px";
+      btnDel.onclick = () => deleteFile(f.id);
+      tdActions.appendChild(btnDel);
+
+      tr.appendChild(tdActions);
+      tbody.appendChild(tr);
+    }
+
+    setStatus("filesStatus", "Liste à jour ✅", "ok");
+  } catch (e) {
+    console.error(e);
+    setStatus("filesStatus", "Erreur réseau list", "error");
+  }
+}
+
+async function uploadFile() {
+  const base = getApiBase();
+  if (!TOKEN) { alert("Connecte-toi d'abord."); return; }
+
+  const input = document.getElementById("fileInput");
+  if (!input.files || input.files.length === 0) { alert("Choisis un fichier."); return; }
+
+  const file = input.files[0];
+  setStatus("uploadStatus", "Upload en cours…", "info");
+
+  const formData = new FormData();
+  formData.append("file", file);
+
+  try {
+    const res = await fetch(base + "/files/upload", {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + TOKEN },
+      body: formData
+    });
+
+    const data = await res.json().catch(async () => ({ _raw: await res.text() }));
+    if (!res.ok) {
+      setStatus("uploadStatus", "Erreur upload: " + res.status + " — " + JSON.stringify(data), "error");
+      return;
+    }
+
+    setStatus("uploadStatus", "Upload OK ✅ : " + (data.filename || file.name), "ok");
+    await refreshFiles();
+  } catch (e) {
+    console.error(e);
+    setStatus("uploadStatus", "Erreur réseau upload", "error");
+  }
+}
+
+async function downloadFile(id, filename) {
+  const base = getApiBase();
+  if (!TOKEN) { alert("Connecte-toi d'abord."); return; }
+
+  try {
+    const res = await fetch(base + "/files/" + id + "/download", {
+      headers: { "Authorization": "Bearer " + TOKEN }
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      alert("Erreur download: " + res.status + " — " + t);
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename || ("file_" + id);
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    console.error(e);
+    alert("Erreur réseau download");
+  }
+}
+
+async function deleteFile(id) {
+  const base = getApiBase();
+  if (!TOKEN) { alert("Connecte-toi d'abord."); return; }
+  if (!confirm("Supprimer le fichier " + id + " ?")) return;
+
+  try {
+    const res = await fetch(base + "/files/" + id, {
+      method: "DELETE",
+      headers: { "Authorization": "Bearer " + TOKEN }
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      alert("Erreur delete: " + res.status + " — " + t);
+      return;
+    }
+    await refreshFiles();
+  } catch (e) {
+    console.error(e);
+    alert("Erreur réseau delete");
+  }
+}
+
+// Boot
+document.getElementById("apiBase").value = DEFAULT_API_BASE;
+setTokenBox();
+apiHealth();
+</script>
+</body>
+</html>

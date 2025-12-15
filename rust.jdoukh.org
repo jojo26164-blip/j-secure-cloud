@@ -1,0 +1,9 @@
+<VirtualHost *:80>
+  ServerName rust.jdoukh.org
+
+  ProxyPreserveHost On
+  RequestHeader set X-Forwarded-Proto "http"
+
+  ProxyPass        /  http://127.0.0.1:9200/
+  ProxyPassReverse /  http://127.0.0.1:9200/
+</VirtualHost>

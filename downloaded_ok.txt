@@ -1,0 +1,9 @@
+HTTP/1.1 200 OK
+content-type: application/octet-stream
+content-disposition: attachment; filename="ok.txt"
+vary: origin, access-control-request-method, access-control-request-headers
+access-control-allow-credentials: true
+transfer-encoding: chunked
+date: Sun, 14 Dec 2025 00:46:14 GMT
+
+hello jsecure
