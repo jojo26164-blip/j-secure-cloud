@@ -43,6 +43,12 @@ async fn main() {
 
     info!("Connexion SQLite OK");
 
+
+sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("migrations failed");
+
     // State + Router
 
 

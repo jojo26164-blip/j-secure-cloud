@@ -1,39 +1,23 @@
-# ======================
 # Secrets
-# ======================
 .env
 
-# ======================
 # DB / data locales
-# ======================
 data/
 *.db
-*.sqlite
-*.sqlite3
 
-# ======================
-# Uploads utilisateurs
-# ======================
+# Uploads
 uploads/
 
-# ======================
-# Node / Playwright
-# ======================
+# Node
 node_modules/
 npm-debug.log*
 pnpm-lock.yaml
 yarn.lock
 
+# Playwright
 test-results/
 playwright-report/
 blob-report/
 
-# ======================
 # Rust
-# ======================
 target/
-
-# ======================
-# Logs
-# ======================
-*.log
