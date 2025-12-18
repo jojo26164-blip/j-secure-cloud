@@ -1,7 +1,39 @@
-/target
-target/
-uploads/
-jsecure-cloud.db
-*.sqlite3
-*.log
+# ======================
+# Secrets
+# ======================
+.env
 
+# ======================
+# DB / data locales
+# ======================
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ======================
+# Uploads utilisateurs
+# ======================
+uploads/
+
+# ======================
+# Node / Playwright
+# ======================
+node_modules/
+npm-debug.log*
+pnpm-lock.yaml
+yarn.lock
+
+test-results/
+playwright-report/
+blob-report/
+
+# ======================
+# Rust
+# ======================
+target/
+
+# ======================
+# Logs
+# ======================
+*.log
