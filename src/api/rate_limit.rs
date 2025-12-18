@@ -1,8 +1,7 @@
-use tracing::warn;
 use axum::{
     body::Body,
     extract::State,
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -11,7 +10,9 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use tracing::warn;
 
+use crate::api::AppState;
 use crate::api::error::ApiError;
 
 #[derive(Clone)]
@@ -21,7 +22,9 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new() -> Self {
-        Self { map: Arc::new(DashMap::new()) }
+        Self {
+            map: Arc::new(DashMap::new()),
+        }
     }
 
     fn hit(&self, key: String, max: u32, window: Duration) -> Result<(), ApiError> {
@@ -35,20 +38,22 @@ impl RateLimiter {
         }
 
         *count += 1;
+
         if *count > max {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                "rate_limited",
-                "Trop de requêtes, réessaie plus tard",
+            return Err(ApiError::bad_request(
+                "RATE_LIMIT: trop de requêtes, réessaie plus tard",
             ));
         }
+
         Ok(())
     }
 }
 
-// Cloudflare -> cf-connecting-ip ; sinon x-forwarded-for ; sinon unknown
 fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+    {
         return v.trim().to_string();
     }
     if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
@@ -57,12 +62,12 @@ fn client_ip(headers: &HeaderMap) -> String {
     "unknown".to_string()
 }
 
-// ✅ Axum 0.7: Next pas générique, Request = Request<Body>
 pub async fn rate_limit_mw(
-    State(limiter): State<RateLimiter>,
+    State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    let limiter = state.limiter.clone();
     let path = req.uri().path().to_string();
     let ip = client_ip(req.headers());
 
@@ -72,29 +77,17 @@ pub async fn rate_limit_mw(
         (3, Duration::from_secs(60))
     } else if path.starts_with("/files/upload") {
         (10, Duration::from_secs(600))
-    } else if path.contains("/download") {
-        (60, Duration::from_secs(60))
     } else if path.starts_with("/files/") {
-        (30, Duration::from_secs(60))
+        (60, Duration::from_secs(60))
     } else {
         (120, Duration::from_secs(60))
     };
 
     let key = format!("{ip}|{path}");
-
     if let Err(e) = limiter.hit(key, max, window) {
-    // 🔒 LOG SÉCURITÉ : rate limit déclenché
-    println!(
-        "[SECURITY][RATE_LIMIT] ip={} path={} max={} window={}s",
-        ip,
-        path,
-        max,
-        window.as_secs()
-    );
-  
-    warn!(ip = %ip, path = %path, max = max, window_secs = window.as_secs(), "rate_limited");
-    return e.into_response();
-}
+        warn!(ip = %ip, path = %path, max = max, window_secs = window.as_secs(), "rate_limited");
+        return e.into_response();
+    }
 
     next.run(req).await
 }

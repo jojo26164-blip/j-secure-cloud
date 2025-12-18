@@ -24,10 +24,7 @@ pub async fn health_handler(
     State(state): State<AppState>,
 ) -> Result<Json<HealthResponse>, (StatusCode, String)> {
     // DB check ultra simple
-    let db_ok = sqlx::query("SELECT 1")
-        .execute(&state.db)
-        .await
-        .is_ok();
+    let db_ok = sqlx::query("SELECT 1").execute(&state.db).await.is_ok();
 
     let uptime = STARTED_AT.elapsed();
 
@@ -40,7 +37,10 @@ pub async fn health_handler(
 
     // Si DB down: on renvoie 503 (pro)
     if !db_ok {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, serde_json::to_string(&resp).unwrap()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::to_string(&resp).unwrap(),
+        ));
     }
 
     Ok(Json(resp))

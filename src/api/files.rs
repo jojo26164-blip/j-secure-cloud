@@ -1,5 +1,3 @@
-use tokio::net::UnixStream;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use axum::{
     body::Body,
     extract::{Multipart, Path as AxumPath, State},
@@ -7,19 +5,17 @@ use axum::{
     response::Response,
     Json,
 };
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
-use std::path::{Path, PathBuf};
-use sqlx::Row;
-use crate::api::AppState;
 use super::auth::get_user_from_headers; // auth.rs est dans le même module api
 use crate::api::error::{ApiError, ApiResult};
-use tracing::{info, warn, error};
-
-
-
-
+use crate::api::AppState;
+use sqlx::Row;
+use std::path::{Path, PathBuf};
+use tokio::fs::File;
+use tokio_util::io::ReaderStream;
+use tracing::{error, info, warn};
 
 async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
     let mut stream = UnixStream::connect("/var/run/clamav/clamd.ctl")
@@ -40,7 +36,10 @@ async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
     }
 
     // fin: len=0
-    stream.write_all(&0u32.to_be_bytes()).await.map_err(|e| e.to_string())?;
+    stream
+        .write_all(&0u32.to_be_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
 
     // lire réponse
     let mut buf = vec![0u8; 4096];
@@ -55,28 +54,15 @@ async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
     }
 }
 
-
-
-
-
-
 fn is_forbidden_extension(filename: &str) -> bool {
     // on met tout en minuscule pour être sûr
     let lower = filename.to_lowercase();
 
     // extensions qu’on interdit pour l’instant
-    let forbidden = [
-        ".exe",
-        ".dll",
-        ".bat",
-        ".cmd",
-        ".sh",
-        ".msi",
-    ];
+    let forbidden = [".exe", ".dll", ".bat", ".cmd", ".sh", ".msi"];
 
     forbidden.iter().any(|ext| lower.ends_with(ext))
 }
-
 
 // ======================================
 //  STRUCTS
@@ -98,10 +84,17 @@ pub struct UploadResponse {
     pub size_bytes: i64,
 }
 
-
+fn uploads_dir() -> PathBuf {
+    std::env::var("UPLOAD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("uploads"))
+}
 
 fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+    {
         return v.trim().to_string();
     }
     if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
@@ -109,7 +102,6 @@ fn client_ip(headers: &HeaderMap) -> String {
     }
     "unknown".to_string()
 }
-
 
 // ======================
 //  LISTE DES FICHIERS
@@ -180,10 +172,7 @@ fn basic_malware_scan(filename: &str, content: &[u8]) -> Result<(), String> {
     // 1) Blocage quelques extensions encore une fois par sécurité
     let forbidden_ext = [".exe", ".bat", ".cmd", ".sh", ".ps1", ".dll"];
     if forbidden_ext.iter().any(|ext| lower_name.ends_with(ext)) {
-        return Err(format!(
-            "Extension dangereuse détectée ({})",
-            lower_name
-        ));
+        return Err(format!("Extension dangereuse détectée ({})", lower_name));
     }
 
     // 2) Signature simple Windows PE : commence par "MZ"
@@ -206,8 +195,6 @@ fn basic_malware_scan(filename: &str, content: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-
-
 pub async fn upload_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -229,23 +216,16 @@ pub async fn upload_handler(
     let mut filename_opt: Option<String> = None;
     let mut bytes_opt: Option<Vec<u8>> = None;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| {
-            warn!(%ip, owner=%owner_email, error=%e, "upload_multipart_read_error");
-            ApiError::bad_request("Erreur lecture multipart")
-        })?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        warn!(%ip, owner=%owner_email, error=%e, "upload_multipart_read_error");
+        ApiError::bad_request("Erreur lecture multipart")
+    })? {
         if field.name() == Some("file") {
             let fname = field.file_name().unwrap_or("upload.bin").to_string();
-            let data = field
-                .bytes()
-                .await
-                .map_err(|e| {
-                    warn!(%ip, owner=%owner_email, file=%fname, error=%e, "upload_file_read_error");
-                    ApiError::bad_request("Erreur lecture fichier")
-                })?;
+            let data = field.bytes().await.map_err(|e| {
+                warn!(%ip, owner=%owner_email, file=%fname, error=%e, "upload_file_read_error");
+                ApiError::bad_request("Erreur lecture fichier")
+            })?;
 
             filename_opt = Some(fname);
             bytes_opt = Some(data.to_vec());
@@ -253,16 +233,17 @@ pub async fn upload_handler(
         }
     }
 
-    let filename =
-        filename_opt.ok_or(ApiError::bad_request("Champ 'file' manquant dans le formulaire"))?;
+    let filename = filename_opt.ok_or(ApiError::bad_request(
+        "Champ 'file' manquant dans le formulaire",
+    ))?;
     let bytes = bytes_opt.ok_or(ApiError::bad_request("Aucune donnée pour le fichier"))?;
 
     info!(%ip, owner=%owner_email, file=%filename, size=bytes.len(), "upload_received");
 
     // ✅ Scan ClamAV AVANT enregistrement
+
     if let Err(reason) = scan_with_clamav(&bytes).await {
-        warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_virus_detected_clamav");
-        return Err(ApiError::virus_detected());
+        return Err(ApiError::bad_request(format!("CLAMAV_FAIL: {reason}")));
     }
 
     // 🔒 Sécurité : extensions interdites
@@ -279,51 +260,51 @@ pub async fn upload_handler(
 
     let size_bytes = bytes.len() as i64;
 
-    // 3) Créer le dossier uploads/ si besoin
-    let upload_dir = Path::new("uploads");
-    if !upload_dir.exists() {
-        tokio::fs::create_dir_all(upload_dir)
-            .await
-            .map_err(|e| {
-                error!(%ip, owner=%owner_email, error=%e, "upload_create_dir_failed");
-                ApiError::internal()
-            })?;
-    }
+    // 3) Dossier upload depuis env (systemd)
+    let upload_dir = std::env::var("UPLOAD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("uploads"));
+    let upload_dir = PathBuf::from(upload_dir);
 
-    // 4) Sauvegarder sur le disque
-    let mut file_path = PathBuf::from(upload_dir);
-    file_path.push(&filename);
+    // (important) créer le dossier si besoin
+    tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
+        error!(%ip, owner=%owner_email, error=%e, "upload_create_dir_failed");
+        ApiError::internal()
+    })?;
 
-    tokio::fs::write(&file_path, &bytes)
-        .await
-        .map_err(|e| {
-            error!(%ip, owner=%owner_email, file=%filename, error=%e, "upload_disk_write_failed");
-            ApiError::internal()
-        })?;
+    // (important) éviter le path traversal: on garde uniquement le nom de fichier
+    let safe_name = Path::new(&filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload.bin")
+        .to_string();
+
+    let file_path = upload_dir.join(&safe_name);
+
+    tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
+        ApiError::bad_request(format!("DISK_WRITE_FAIL: {e} path={}", file_path.display()))
+    })?;
 
     // 5) Enregistrer dans la base
     sqlx::query(
         r#"
-        INSERT INTO files (filename, owner, size_bytes, created_at)
-        VALUES (?1, ?2, ?3, datetime('now'))
-        "#,
+    INSERT INTO files (filename, owner, size_bytes, created_at)
+    VALUES (?1, ?2, ?3, datetime('now'))
+"#,
     )
-    .bind(&filename)
+    .bind(&safe_name)
     .bind(&owner_email)
     .bind(size_bytes)
     .execute(&state.db)
     .await
-    .map_err(|e| {
-        error!(%ip, owner=%owner_email, file=%filename, error=%e, "upload_db_insert_failed");
-        ApiError::internal()
-    })?;
+    .map_err(|e| ApiError::bad_request(format!("DB_INSERT_FAIL: {e}")))?;
 
-    info!(%ip, owner=%owner_email, file=%filename, size_bytes=size_bytes, "upload_ok");
+    info!(%ip, owner=%owner_email, file=%safe_name, size_bytes=size_bytes, "upload_ok");
 
     Ok(Json(UploadResponse {
         status: "ok".to_string(),
         message: "Fichier uploadé".to_string(),
-        filename,
+        filename: safe_name,
         size_bytes,
     }))
 }
@@ -344,28 +325,26 @@ pub async fn download_handler(
     };
 
     // 2) récupérer le fichier dans la DB
-    let row = sqlx::query(
-        r#"SELECT filename, owner FROM files WHERE id = ?1"#,
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Fichier id {} introuvable: {e}", id),
-        )
-    })?;
+    let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Fichier id {} introuvable: {e}", id),
+            )
+        })?;
 
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
     if owner != owner_email {
-      warn!(
-    user = %owner_email,
-    file_id = id,
-    "download_forbidden"
-);
+        warn!(
+            user = %owner_email,
+            file_id = id,
+            "download_forbidden"
+        );
         return Err((
             StatusCode::FORBIDDEN,
             "Accès interdit : ce fichier ne vous appartient pas".to_string(),
@@ -373,14 +352,29 @@ pub async fn download_handler(
     }
 
     // 3) ouvrir le fichier sur disque
-    let mut path = PathBuf::from("uploads");
-    path.push(&filename);
+    let safe_name = Path::new(&filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload.bin")
+        .to_string();
+
+    let path = uploads_dir().join(&safe_name);
 
     let file = tokio::fs::File::open(&path).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Erreur ouverture fichier: {e}"),
-        )
+        if e.kind() == std::io::ErrorKind::NotFound {
+            (
+                StatusCode::NOT_FOUND,
+                format!(
+                    "Fichier absent sur disque (id={id}) path={}",
+                    path.display()
+                ),
+            )
+        } else {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Erreur ouverture fichier: {e} path={}", path.display()),
+            )
+        }
     })?;
 
     let stream = ReaderStream::new(file);
@@ -400,11 +394,9 @@ pub async fn download_handler(
                 format!("Erreur création réponse: {e}"),
             )
         })?;
-info!(owner = %owner_email, file_id = id, filename = %filename, "download_ok");
+    info!(owner = %owner_email, file_id = id, filename = %filename, "download_ok");
     Ok(resp)
 }
-
-
 
 // ======================
 //  DELETE FICHIER
@@ -417,29 +409,27 @@ pub async fn delete_handler(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // 1) Récupérer l’email depuis le JWT
     let owner_email = match get_user_from_headers(&headers) {
-    Ok(email) => email,
-    Err(msg) => return Err((StatusCode::UNAUTHORIZED, msg)),
-};
+        Ok(email) => email,
+        Err(msg) => return Err((StatusCode::UNAUTHORIZED, msg)),
+    };
     // 2) Récupérer filename + owner dans la DB
-    let row = sqlx::query(
-        r#"SELECT filename, owner FROM files WHERE id = ?1"#,
-    )
-    .bind(id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            format!("Fichier id {} introuvable: {e}", id),
-        )
-    })?;
+    let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Fichier id {} introuvable: {e}", id),
+            )
+        })?;
 
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
     // 3) Vérifier que le fichier appartient bien à l’utilisateur connecté
     if owner != owner_email {
-warn!(owner = %owner_email, file_owner = %owner, file_id = id, "delete_forbidden");
+        warn!(owner = %owner_email, file_owner = %owner, file_id = id, "delete_forbidden");
         return Err((
             StatusCode::FORBIDDEN,
             "Accès interdit : ce fichier ne vous appartient pas".to_string(),
@@ -447,9 +437,13 @@ warn!(owner = %owner_email, file_owner = %owner, file_id = id, "delete_forbidden
     }
 
     // 4) Supprimer le fichier sur disque (si présent)
-    let mut path = PathBuf::from("uploads");
-    path.push(&filename);
+    let safe_name = Path::new(&filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("upload.bin")
+        .to_string();
 
+    let path = uploads_dir().join(&safe_name);
     if let Err(e) = tokio::fs::remove_file(&path).await {
         // On ignore si le fichier n'existe plus, sinon on renvoie une erreur
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -461,21 +455,19 @@ warn!(owner = %owner_email, file_owner = %owner, file_id = id, "delete_forbidden
     }
 
     // 5) Supprimer l’entrée en base
-    sqlx::query(
-        r#"DELETE FROM files WHERE id = ?1"#,
-    )
-    .bind(id)
-    .execute(&state.db)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Erreur DB (delete): {e}"),
-        )
-    })?;
+    sqlx::query(r#"DELETE FROM files WHERE id = ?1"#)
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Erreur DB (delete): {e}"),
+            )
+        })?;
 
     // 6) Réponse OK
-info!(owner = %owner_email, file_id = id, filename = %filename, "delete_ok");
+    info!(owner = %owner_email, file_id = id, filename = %filename, "delete_ok");
     Ok(Json(serde_json::json!({
         "status": "ok",
         "message": format!("Fichier {} supprimé", id),
