@@ -6,8 +6,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-mod api;
-use api::{api_router, AppState};
+use jsecure_cloud::api::{api_router, AppState};
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));

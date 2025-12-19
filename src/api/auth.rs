@@ -3,8 +3,11 @@ use argon2::{
     Argon2,
 };
 use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
+    body::Body,
+    extract::{Request, State},
+    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    middleware::Next,
+    response::Response,
     Json,
 };
 use chrono::{Duration as ChronoDuration, Utc};
@@ -52,10 +55,10 @@ fn create_jwt(email: &str) -> Result<String, (StatusCode, String)> {
     })
 }
 
-// ✅ Utilisé par files.rs pour récupérer l'email depuis Authorization: Bearer <token>
+// ✅ Utilisé encore (fallback) si tu veux lire l'email depuis Authorization: Bearer <token>
 pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
     let auth_header = headers
-        .get(axum::http::header::AUTHORIZATION)
+        .get(AUTHORIZATION)
         .ok_or_else(|| "Header Authorization manquant".to_string())?
         .to_str()
         .map_err(|_| "Header Authorization invalide".to_string())?;
@@ -65,7 +68,27 @@ pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
     }
 
     let token = &auth_header[7..];
+    verify_jwt_email(token)
+}
 
+// ================================
+// AuthUser + Middleware (3.5)
+// ================================
+#[derive(Clone, Debug)]
+pub struct AuthUser {
+    pub email: String,
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let h = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    let h = h.trim();
+    let token = h
+        .strip_prefix("Bearer ")
+        .or_else(|| h.strip_prefix("bearer "))?;
+    Some(token.trim().to_string())
+}
+
+fn verify_jwt_email(token: &str) -> Result<String, String> {
     let token_data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(&jwt_secret_bytes()),
@@ -74,6 +97,17 @@ pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
     .map_err(|_| "Token invalide ou expiré".to_string())?;
 
     Ok(token_data.claims.sub)
+}
+
+// Middleware: protège /files/* (via route_layer dans api/mod.rs)
+pub async fn auth_middleware(mut req: Request<Body>, next: Next) -> Result<Response, StatusCode> {
+    let token = bearer_token(req.headers()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let email = verify_jwt_email(&token).map_err(|_| StatusCode::UNAUTHORIZED)?;
+
+    // ✅ injecte l'utilisateur dans Extensions => Extension<AuthUser> dans files.rs
+    req.extensions_mut().insert(AuthUser { email });
+
+    Ok(next.run(req).await)
 }
 
 // ================================
@@ -244,8 +278,7 @@ pub async fn login_handler(
         ));
     }
 
-    let token = create_jwt(&email).map_err(|(code, msg)| (code, msg))?;
-
+    let token = create_jwt(&email)?;
     info!(email = %payload.email, "login_ok");
 
     Ok(Json(AuthResponse {

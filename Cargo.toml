@@ -25,3 +25,12 @@ clamav-client = "2.2.0"
 dashmap = "5"
 dotenvy = "0.15"
 anyhow = "1"
+
+[dev-dependencies]
+tower = "0.5"
+http-body-util = "0.1"
+mime = "0.3"
+
+[lib]
+name = "jsecure_cloud"
+path = "src/lib.rs"

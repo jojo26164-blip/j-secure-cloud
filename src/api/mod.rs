@@ -16,7 +16,7 @@ pub struct AppState {
 }
 
 pub fn api_router(state: AppState) -> Router {
-    // CORS (dev friendly). En prod tu mettras une origin stricte.
+    // CORS (dev friendly). En prod: origin stricte.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -29,12 +29,13 @@ pub fn api_router(state: AppState) -> Router {
         .route("/auth/register", post(auth::register_handler));
 
     // ✅ Routes protégées (token requis)
-    // (la protection se fait DANS les handlers via get_user_from_headers)
     let protected = Router::new()
         .route("/files", get(files::list_files_handler))
         .route("/files/upload", post(files::upload_handler))
         .route("/files/:id/download", get(files::download_handler))
-        .route("/files/:id", delete(files::delete_handler));
+        .route("/files/:id", delete(files::delete_handler))
+        // 🔒 Middleware auth UNIQUEMENT pour /files/*
+        .route_layer(axum::middleware::from_fn(auth::auth_middleware));
 
     // ✅ API finale: /api/...
     Router::new()
