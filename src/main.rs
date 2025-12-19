@@ -43,20 +43,15 @@ async fn main() {
 
     info!("Connexion SQLite OK");
 
-
-sqlx::migrate!("./migrations")
+    sqlx::migrate!("./migrations")
         .run(&db)
         .await
         .expect("migrations failed");
 
     // State + Router
 
-
-let state = AppState {
-    db,
-    limiter: api::rate_limit::RateLimiter::new(),
-};
-let app: Router = api_router(state);
+    let state = AppState { db };
+    let app: Router = api_router(state);
 
     // Listener + serve (Axum 0.7)
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("HOST invalide");

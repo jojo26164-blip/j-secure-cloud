@@ -1,7 +1,9 @@
-use axum::middleware::Next;
-use axum::response::Response;
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
-    extract::{Request, State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     Json,
 };
@@ -11,29 +13,14 @@ use once_cell::sync::Lazy;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
-
-use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
-};
+use tracing::{info, warn};
 
 use crate::api::AppState;
 
-use tracing::{info, warn};
-
-pub async fn auth_middleware(mut req: Request, next: Next) -> Result<Response, StatusCode> {
-    let email = get_user_from_headers(req.headers()).map_err(|_| StatusCode::UNAUTHORIZED)?;
-
-    req.extensions_mut().insert(email);
-    Ok(next.run(req).await)
-}
-
 // =====================
-// JWT CONFIG (Phase 1: secret via env)
+// JWT CONFIG
 // =====================
 fn jwt_secret_bytes() -> Vec<u8> {
-    // En prod: mettre une vraie valeur longue dans .env
-    // En dev: fallback pour éviter de casser
     std::env::var("JWT_SECRET")
         .unwrap_or_else(|_| "DEV_SECRET_A_CHANGER".to_string())
         .into_bytes()
@@ -65,9 +52,10 @@ fn create_jwt(email: &str) -> Result<String, (StatusCode, String)> {
     })
 }
 
+// ✅ Utilisé par files.rs pour récupérer l'email depuis Authorization: Bearer <token>
 pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
     let auth_header = headers
-        .get("authorization")
+        .get(axum::http::header::AUTHORIZATION)
         .ok_or_else(|| "Header Authorization manquant".to_string())?
         .to_str()
         .map_err(|_| "Header Authorization invalide".to_string())?;
@@ -77,6 +65,7 @@ pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
     }
 
     let token = &auth_header[7..];
+
     let token_data = decode::<Claims>(
         token,
         &DecodingKey::from_secret(&jwt_secret_bytes()),
@@ -111,8 +100,7 @@ pub struct RegisterRequest {
 }
 
 // ================================
-// Anti-bruteforce (tu l’avais, mais pas encore branché)
-// On le laisse en place pour Phase 1/2 si tu veux l’activer ensuite.
+// Anti-bruteforce mémoire (simple)
 // ================================
 #[derive(Debug, Clone)]
 struct AttemptInfo {
@@ -133,7 +121,6 @@ pub async fn register_handler(
     State(state): State<AppState>,
     Json(payload): Json<RegisterRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    // 1) Vérifier si l'email existe déjà
     let exists: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM users WHERE email = ?1 LIMIT 1")
         .bind(&payload.email)
         .fetch_optional(&state.db)
@@ -153,7 +140,6 @@ pub async fn register_handler(
         ));
     }
 
-    // 2) Hasher le mot de passe avec Argon2
     let salt = SaltString::generate(&mut OsRng);
     let hashed_password = Argon2::default()
         .hash_password(payload.password.as_bytes(), &salt)
@@ -165,7 +151,6 @@ pub async fn register_handler(
         })?
         .to_string();
 
-    // 3) Insert dans la base
     sqlx::query("INSERT INTO users (email, password_hash) VALUES (?1, ?2)")
         .bind(&payload.email)
         .bind(&hashed_password)
@@ -179,6 +164,7 @@ pub async fn register_handler(
         })?;
 
     info!(email = %payload.email, "register_ok");
+
     Ok(Json(AuthResponse {
         status: "ok".to_string(),
         message: "Utilisateur créé".to_string(),
@@ -194,7 +180,7 @@ pub async fn login_handler(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Json<AuthResponse>, (StatusCode, String)> {
-    // Anti-bruteforce en mémoire (Phase 1/2 stable)
+    // anti bruteforce
     {
         let mut map = LOGIN_ATTEMPTS.lock().unwrap();
         let entry = map.entry(payload.email.clone()).or_insert(AttemptInfo {
@@ -216,7 +202,6 @@ pub async fn login_handler(
         }
     }
 
-    // 1) Récupérer l'utilisateur par email
     let row = sqlx::query(r#"SELECT email, password_hash FROM users WHERE email = ?1"#)
         .bind(&payload.email)
         .fetch_one(&state.db)
@@ -231,10 +216,8 @@ pub async fn login_handler(
     let email: String = row.try_get("email").unwrap_or_default();
     let stored_hash: String = row.try_get("password_hash").unwrap_or_default();
 
-    // 2) Vérifier le mot de passe
     let valid = verify_password(&stored_hash, &payload.password);
 
-    // Met à jour le compteur mémoire
     {
         let mut map = LOGIN_ATTEMPTS.lock().unwrap();
         let entry = map.entry(payload.email.clone()).or_insert(AttemptInfo {
@@ -261,7 +244,6 @@ pub async fn login_handler(
         ));
     }
 
-    // 3) Créer le JWT
     let token = create_jwt(&email).map_err(|(code, msg)| (code, msg))?;
 
     info!(email = %payload.email, "login_ok");
@@ -273,6 +255,7 @@ pub async fn login_handler(
         token: Some(token),
     }))
 }
+
 fn verify_password(hashed: &str, password: &str) -> bool {
     let parsed = match PasswordHash::new(hashed) {
         Ok(h) => h,

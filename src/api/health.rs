@@ -1,6 +1,6 @@
 use axum::{extract::State, http::StatusCode, Json};
 use serde::Serialize;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::api::AppState;
 

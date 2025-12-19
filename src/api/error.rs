@@ -3,77 +3,108 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+
+use serde::Serialize;
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
-#[derive(Debug)]
-pub enum ApiError {
-    BadRequest(String),
-    Unauthorized,
-    Forbidden,
-    NotFound,
-    VirusDetected,
-    FileRefused,
-    Internal,
+#[derive(Debug, Serialize, Clone)]
+pub struct ApiErrorBody {
+    pub error: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub body: ApiErrorBody,
 }
 
 impl ApiError {
-    pub fn bad_request<M: Into<String>>(msg: M) -> Self {
-        ApiError::BadRequest(msg.into())
+    pub fn new(status: StatusCode, error: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: ApiErrorBody {
+                error,
+                message: message.into(),
+            },
+        }
     }
 
+    // 400
+    pub fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "BAD_REQUEST", message)
+    }
+
+    // 401
     pub fn unauthorized() -> Self {
-        ApiError::Unauthorized
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "token manquant ou invalide",
+        )
+    }
+    pub fn unauthorized_msg(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", message)
     }
 
-    pub fn forbidden() -> Self {
-        ApiError::Forbidden
+    // 403
+    pub fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "FORBIDDEN", message)
     }
 
-    pub fn not_found() -> Self {
-        ApiError::NotFound
+    // 404
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message)
+    }
+
+    // 409
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, "CONFLICT", message)
+    }
+
+    // 429
+    pub fn rate_limited(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT", message)
+    }
+
+    // 500
+    pub fn internal() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL",
+            "erreur interne",
+        )
+    }
+    pub fn internal_msg(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
+    }
+
+    // Spécifiques fichiers
+    pub fn file_refused() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "FILE_REFUSED",
+            "type de fichier interdit",
+        )
     }
 
     pub fn virus_detected() -> Self {
-        ApiError::VirusDetected
-    }
-
-    pub fn file_refused() -> Self {
-        ApiError::FileRefused
-    }
-
-    pub fn internal() -> Self {
-        ApiError::Internal
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "VIRUS_DETECTED",
+            "fichier infecté détecté",
+        )
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            ApiError::Unauthorized => (StatusCode::UNAUTHORIZED, "Non autorisé".to_string()),
-            ApiError::Forbidden => (StatusCode::FORBIDDEN, "Accès interdit".to_string()),
-            ApiError::NotFound => (StatusCode::NOT_FOUND, "Introuvable".to_string()),
-            ApiError::VirusDetected => (
-                StatusCode::BAD_REQUEST,
-                "Fichier infecté détecté".to_string(),
-            ),
-            ApiError::FileRefused => (
-                StatusCode::BAD_REQUEST,
-                "Type de fichier interdit".to_string(),
-            ),
-            ApiError::Internal => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Erreur serveur".to_string(),
-            ),
-        };
-
-        let body = Json(json!({
-            "error": status.as_str(),
-            "message": message
-        }));
-
-        (status, body).into_response()
+        (self.status, Json(self.body)).into_response()
     }
+}
+
+// Helper pour convertir facilement une erreur sqlx en ApiError
+pub fn db_err(context: &'static str, e: sqlx::Error) -> ApiError {
+    ApiError::internal_msg(format!("Erreur DB ({context}): {e}"))
 }

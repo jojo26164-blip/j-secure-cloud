@@ -1,20 +1,21 @@
 use axum::{
     body::Body,
     extract::{Multipart, Path as AxumPath, State},
-    http::{header, HeaderMap, StatusCode},
-    response::Response,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio_util::io::ReaderStream;
 
-use super::auth::get_user_from_headers; // auth.rs est dans le même module api
+use crate::api::auth::get_user_from_headers;
 use crate::api::error::{ApiError, ApiResult};
 use crate::api::AppState;
+
 use sqlx::Row;
 use std::path::{Path, PathBuf};
-use tokio::fs::File;
-use tokio_util::io::ReaderStream;
 use tracing::{error, info, warn};
 
 async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
@@ -113,7 +114,7 @@ pub async fn list_files_handler(
 ) -> Result<Json<Vec<FileEntry>>, (StatusCode, String)> {
     let ip = client_ip(&headers);
 
-    // 1) Récupérer l’email depuis le JWT
+    // email depuis token
     let owner_email = match get_user_from_headers(&headers) {
         Ok(email) => email,
         Err(msg) => {
@@ -124,7 +125,6 @@ pub async fn list_files_handler(
 
     info!(%ip, owner=%owner_email, "list_start");
 
-    // 2) Charger tous les fichiers de cet utilisateur dans la DB
     let rows = sqlx::query(
         r#"
         SELECT id, filename, owner, size_bytes, created_at
@@ -144,7 +144,6 @@ pub async fn list_files_handler(
         )
     })?;
 
-    // 3) Transformer en Vec<FileEntry>
     let entries: Vec<FileEntry> = rows
         .into_iter()
         .map(|row| FileEntry {
@@ -157,53 +156,47 @@ pub async fn list_files_handler(
         .collect();
 
     info!(%ip, owner=%owner_email, count=entries.len(), "list_ok");
-
     Ok(Json(entries))
 }
-// ======================
-//  UPLOAD FICHIER
-// ======================
 
-// Petit scanner maison (version 0.1)
-// Tu pourras l'améliorer plus tard ou le remplacer par un vrai moteur.
 fn basic_malware_scan(filename: &str, content: &[u8]) -> Result<(), String> {
     let lower_name = filename.to_lowercase();
 
-    // 1) Blocage quelques extensions encore une fois par sécurité
-    let forbidden_ext = [".exe", ".bat", ".cmd", ".sh", ".ps1", ".dll"];
+    // 1) extensions interdites (double sécurité)
+    let forbidden_ext = [".exe", ".bat", ".cmd", ".sh", ".ps1", ".dll", ".msi"];
     if forbidden_ext.iter().any(|ext| lower_name.ends_with(ext)) {
-        return Err(format!("Extension dangereuse détectée ({})", lower_name));
+        return Err(format!("Extension dangereuse détectée ({lower_name})"));
     }
 
-    // 2) Signature simple Windows PE : commence par "MZ"
+    // 2) signature Windows PE (MZ)
     if content.starts_with(b"MZ") {
-        return Err("Fichier de type exécutable (signature MZ)".to_string());
+        return Err("Fichier exécutable détecté (signature MZ)".to_string());
     }
 
-    // 3) Script bash / shell
+    // 3) shebang scripts
     if content.starts_with(b"#!/bin/bash")
         || content.starts_with(b"#!/usr/bin/env bash")
         || content.starts_with(b"#!/bin/sh")
+        || content.starts_with(b"#!/usr/bin/env sh")
     {
         return Err("Script shell détecté (shebang)".to_string());
     }
 
-    // 4) TODO : ici tu pourras ajouter :
-    //    - signatures (hash)
-    //    - règles heuristiques
-    //    - connexion à un daemon ClamAV
     Ok(())
 }
+
+// ======================
+//  UPLOAD FICHIER
+// ======================
 
 pub async fn upload_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> ApiResult<Json<UploadResponse>> {
+) -> ApiResult<impl IntoResponse> {
     let ip = client_ip(&headers);
-    info!(%ip, "upload_start");
 
-    // 1) vérifier le JWT et récupérer l'email propriétaire
+    // email depuis token
     let owner_email = match get_user_from_headers(&headers) {
         Ok(email) => email,
         Err(msg) => {
@@ -212,7 +205,9 @@ pub async fn upload_handler(
         }
     };
 
-    // 2) Récupérer le champ "file" dans le formulaire multipart
+    info!(%ip, owner=%owner_email, "upload_start");
+
+    // lire le champ multipart "file"
     let mut filename_opt: Option<String> = None;
     let mut bytes_opt: Option<Vec<u8>> = None;
 
@@ -241,38 +236,32 @@ pub async fn upload_handler(
     info!(%ip, owner=%owner_email, file=%filename, size=bytes.len(), "upload_received");
 
     // ✅ Scan ClamAV AVANT enregistrement
-
     if let Err(reason) = scan_with_clamav(&bytes).await {
         return Err(ApiError::bad_request(format!("CLAMAV_FAIL: {reason}")));
     }
 
-    // 🔒 Sécurité : extensions interdites
+    // 🔒 extensions interdites
     if is_forbidden_extension(&filename) {
         warn!(%ip, owner=%owner_email, file=%filename, "upload_blocked_forbidden_extension");
-        return Err(ApiError::file_refused());
+        return Err(ApiError::bad_request("type de fichier interdit"));
     }
 
-    // 🔍 Scan basique (ton scanner maison)
+    // 🔍 scan basique
     if let Err(reason) = basic_malware_scan(&filename, &bytes) {
         warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_blocked_basic_scan");
-        return Err(ApiError::virus_detected());
+        return Err(ApiError::bad_request("virus détecté"));
     }
 
     let size_bytes = bytes.len() as i64;
 
-    // 3) Dossier upload depuis env (systemd)
-    let upload_dir = std::env::var("UPLOAD_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("uploads"));
-    let upload_dir = PathBuf::from(upload_dir);
-
-    // (important) créer le dossier si besoin
+    // dossier upload
+    let upload_dir = uploads_dir();
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
         error!(%ip, owner=%owner_email, error=%e, "upload_create_dir_failed");
         ApiError::internal()
     })?;
 
-    // (important) éviter le path traversal: on garde uniquement le nom de fichier
+    // éviter path traversal
     let safe_name = Path::new(&filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -280,17 +269,16 @@ pub async fn upload_handler(
         .to_string();
 
     let file_path = upload_dir.join(&safe_name);
-
     tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
         ApiError::bad_request(format!("DISK_WRITE_FAIL: {e} path={}", file_path.display()))
     })?;
 
-    // 5) Enregistrer dans la base
+    // insert DB
     sqlx::query(
         r#"
-    INSERT INTO files (filename, owner, size_bytes, created_at)
-    VALUES (?1, ?2, ?3, datetime('now'))
-"#,
+        INSERT INTO files (filename, owner, size_bytes, created_at)
+        VALUES (?1, ?2, ?3, datetime('now'))
+        "#,
     )
     .bind(&safe_name)
     .bind(&owner_email)
@@ -318,12 +306,10 @@ pub async fn download_handler(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Response, (StatusCode, String)> {
-    // 1) email depuis le token
     let owner_email = match get_user_from_headers(&headers) {
         Ok(email) => email,
         Err(msg) => return Err((StatusCode::UNAUTHORIZED, msg)),
     };
-
     // 2) récupérer le fichier dans la DB
     let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
         .bind(id)
@@ -407,11 +393,11 @@ pub async fn delete_handler(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // 1) Récupérer l’email depuis le JWT
     let owner_email = match get_user_from_headers(&headers) {
         Ok(email) => email,
         Err(msg) => return Err((StatusCode::UNAUTHORIZED, msg)),
     };
+
     // 2) Récupérer filename + owner dans la DB
     let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
         .bind(id)

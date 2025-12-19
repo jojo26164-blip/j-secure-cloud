@@ -1,45 +1,44 @@
 use axum::{
-    middleware,
     routing::{delete, get, post},
     Router,
 };
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use tower_http::cors::{Any, CorsLayer};
 
 pub mod auth;
 pub mod error;
 pub mod files;
 pub mod health;
-pub mod rate_limit;
-
-use crate::api::rate_limit::rate_limit_mw;
-use crate::api::rate_limit::RateLimiter;
+// pub mod rate_limit; // (on l'activera après quand ce sera stable)
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::SqlitePool,
-    pub limiter: RateLimiter, // ✅ ajouté
 }
 
 pub fn api_router(state: AppState) -> Router {
+    // CORS (dev friendly). En prod tu mettras une origin stricte.
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
-        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+        .allow_headers(Any);
 
-    let api = Router::new()
+    // ✅ Routes publiques (pas besoin de token)
+    let public = Router::new()
         .route("/health", get(health::health_handler))
         .route("/auth/login", post(auth::login_handler))
-        .route("/auth/register", post(auth::register_handler))
+        .route("/auth/register", post(auth::register_handler));
+
+    // ✅ Routes protégées (token requis)
+    // (la protection se fait DANS les handlers via get_user_from_headers)
+    let protected = Router::new()
         .route("/files", get(files::list_files_handler))
         .route("/files/upload", post(files::upload_handler))
         .route("/files/:id/download", get(files::download_handler))
-        .route("/files/:id", delete(files::delete_handler))
-        // ✅ rate limit lit l'état AppState
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_mw));
+        .route("/files/:id", delete(files::delete_handler));
 
+    // ✅ API finale: /api/...
     Router::new()
-        .nest("/api", api)
+        .nest("/api", public.merge(protected))
         .layer(cors)
         .with_state(state)
 }

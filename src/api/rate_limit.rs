@@ -12,7 +12,6 @@ use std::{
 };
 use tracing::warn;
 
-use crate::api::AppState;
 use crate::api::error::ApiError;
 
 #[derive(Clone)]
@@ -40,7 +39,7 @@ impl RateLimiter {
         *count += 1;
 
         if *count > max {
-            return Err(ApiError::bad_request(
+            return Err(ApiError::rate_limited(
                 "RATE_LIMIT: trop de requêtes, réessaie plus tard",
             ));
         }
@@ -63,11 +62,10 @@ fn client_ip(headers: &HeaderMap) -> String {
 }
 
 pub async fn rate_limit_mw(
-    State(state): State<AppState>,
+    State(limiter): State<RateLimiter>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let limiter = state.limiter.clone();
     let path = req.uri().path().to_string();
     let ip = client_ip(req.headers());
 
