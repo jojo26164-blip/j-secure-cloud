@@ -1,6 +1,6 @@
 use axum::{
     body::Body,
-    extract::{Extension, Multipart, Path as AxumPath, State},
+    extract::{Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -10,13 +10,20 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::io::ReaderStream;
 
-use crate::api::auth::AuthUser;
-use crate::api::error::{ApiError, ApiResult};
-use crate::api::AppState;
-
 use sqlx::Row;
 use std::path::{Path, PathBuf};
 use tracing::{error, info, warn};
+
+use crate::api::auth::get_user_from_headers;
+use crate::api::error::{ApiError, ApiResult};
+use crate::api::AppState;
+
+use crate::api::rate_limit::rate_limit_or_err;
+use std::time::Duration;
+
+// ======================
+// Helpers
+// ======================
 
 async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
     let mut stream = UnixStream::connect("/var/run/clamav/clamd.ctl")
@@ -56,28 +63,8 @@ async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
 
 fn is_forbidden_extension(filename: &str) -> bool {
     let lower = filename.to_lowercase();
-    let forbidden = [".exe", ".dll", ".bat", ".cmd", ".sh", ".msi"];
+    let forbidden = [".exe", ".dll", ".bat", ".cmd", ".sh", ".msi", ".ps1"];
     forbidden.iter().any(|ext| lower.ends_with(ext))
-}
-
-// ======================================
-// STRUCTS
-// ======================================
-#[derive(serde::Serialize)]
-pub struct FileEntry {
-    pub id: i64,
-    pub filename: String,
-    pub owner: String,
-    pub size_bytes: i64,
-    pub created_at: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct UploadResponse {
-    pub status: String,
-    pub message: String,
-    pub filename: String,
-    pub size_bytes: i64,
 }
 
 fn uploads_dir() -> PathBuf {
@@ -102,15 +89,18 @@ fn client_ip(headers: &HeaderMap) -> String {
 fn basic_malware_scan(filename: &str, content: &[u8]) -> Result<(), String> {
     let lower_name = filename.to_lowercase();
 
+    // extensions interdites (double sécurité)
     let forbidden_ext = [".exe", ".bat", ".cmd", ".sh", ".ps1", ".dll", ".msi"];
     if forbidden_ext.iter().any(|ext| lower_name.ends_with(ext)) {
         return Err(format!("Extension dangereuse détectée ({lower_name})"));
     }
 
+    // signature Windows PE (MZ)
     if content.starts_with(b"MZ") {
         return Err("Fichier exécutable détecté (signature MZ)".to_string());
     }
 
+    // shebang scripts
     if content.starts_with(b"#!/bin/bash")
         || content.starts_with(b"#!/usr/bin/env bash")
         || content.starts_with(b"#!/bin/sh")
@@ -123,15 +113,43 @@ fn basic_malware_scan(filename: &str, content: &[u8]) -> Result<(), String> {
 }
 
 // ======================
-// LISTE DES FICHIERS
+// Structs
 // ======================
+
+#[derive(serde::Serialize)]
+pub struct FileEntry {
+    pub id: i64,
+    pub filename: String,
+    pub owner: String,
+    pub size_bytes: i64,
+    pub created_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct UploadResponse {
+    pub status: String,
+    pub message: String,
+    pub filename: String,
+    pub size_bytes: i64,
+}
+
+// ======================
+// LIST FILES
+// ======================
+
 pub async fn list_files_handler(
     headers: HeaderMap,
-    Extension(user): Extension<AuthUser>,
     State(state): State<AppState>,
-) -> Result<Json<Vec<FileEntry>>, (StatusCode, String)> {
+) -> ApiResult<Json<Vec<FileEntry>>> {
     let ip = client_ip(&headers);
-    let owner_email = user.email;
+
+    let owner_email = match get_user_from_headers(&headers) {
+        Ok(email) => email,
+        Err(msg) => {
+            warn!(%ip, %msg, "list_unauthorized");
+            return Err(ApiError::unauthorized());
+        }
+    };
 
     info!(%ip, owner=%owner_email, "list_start");
 
@@ -148,10 +166,7 @@ pub async fn list_files_handler(
     .await
     .map_err(|e| {
         error!(%ip, owner=%owner_email, error=%e, "list_db_error");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Erreur DB (select files): {e}"),
-        )
+        ApiError::internal()
     })?;
 
     let entries: Vec<FileEntry> = rows
@@ -170,19 +185,30 @@ pub async fn list_files_handler(
 }
 
 // ======================
-// UPLOAD FICHIER
+// UPLOAD
 // ======================
+
 pub async fn upload_handler(
     headers: HeaderMap,
-    Extension(user): Extension<AuthUser>,
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> ApiResult<impl IntoResponse> {
     let ip = client_ip(&headers);
-    let owner_email = user.email;
+
+    // ✅ Rate limit IP upload (ex: 30/min)
+    rate_limit_or_err(&headers, "upload", 30, Duration::from_secs(60))?;
+
+    let owner_email = match get_user_from_headers(&headers) {
+        Ok(email) => email,
+        Err(msg) => {
+            warn!(%ip, %msg, "upload_unauthorized");
+            return Err(ApiError::unauthorized());
+        }
+    };
 
     info!(%ip, owner=%owner_email, "upload_start");
 
+    // lire le champ multipart "file"
     let mut filename_opt: Option<String> = None;
     let mut bytes_opt: Option<Vec<u8>> = None;
 
@@ -202,15 +228,15 @@ pub async fn upload_handler(
         }
     }
 
-    let filename = filename_opt.ok_or(ApiError::bad_request(
-        "Champ 'file' manquant dans le formulaire",
-    ))?;
-    let bytes = bytes_opt.ok_or(ApiError::bad_request("Aucune donnée pour le fichier"))?;
+    let filename = filename_opt
+        .ok_or_else(|| ApiError::bad_request("Champ 'file' manquant dans le formulaire"))?;
+    let bytes = bytes_opt.ok_or_else(|| ApiError::bad_request("Aucune donnée pour le fichier"))?;
 
     info!(%ip, owner=%owner_email, file=%filename, size=bytes.len(), "upload_received");
 
-    // ✅ Scan ClamAV
+    // ✅ Scan ClamAV AVANT enregistrement
     if let Err(reason) = scan_with_clamav(&bytes).await {
+        warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_blocked_clamav");
         return Err(ApiError::bad_request(format!("CLAMAV_FAIL: {reason}")));
     }
 
@@ -228,12 +254,14 @@ pub async fn upload_handler(
 
     let size_bytes = bytes.len() as i64;
 
+    // dossier upload
     let upload_dir = uploads_dir();
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
         error!(%ip, owner=%owner_email, error=%e, "upload_create_dir_failed");
         ApiError::internal()
     })?;
 
+    // éviter path traversal
     let safe_name = Path::new(&filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -246,6 +274,7 @@ pub async fn upload_handler(
         ApiError::bad_request(format!("DISK_WRITE_FAIL: {e} path={}", file_path.display()))
     })?;
 
+    // insert DB
     sqlx::query(
         r#"
         INSERT INTO files (filename, owner, size_bytes, created_at)
@@ -270,38 +299,42 @@ pub async fn upload_handler(
 }
 
 // ======================
-// DOWNLOAD FICHIER
+// DOWNLOAD
 // ======================
+
 pub async fn download_handler(
-    _headers: HeaderMap,
-    Extension(user): Extension<AuthUser>,
+    headers: HeaderMap,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
-) -> Result<Response, (StatusCode, String)> {
-    let owner_email = user.email;
+) -> ApiResult<Response> {
+    let ip = client_ip(&headers);
 
+    let owner_email = match get_user_from_headers(&headers) {
+        Ok(email) => email,
+        Err(msg) => {
+            warn!(%ip, %msg, "download_unauthorized");
+            return Err(ApiError::unauthorized());
+        }
+    };
+
+    // récupérer le fichier dans la DB
     let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
         .bind(id)
         .fetch_one(&state.db)
         .await
         .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Fichier id {id} introuvable: {e}"),
-            )
+            warn!(%ip, owner=%owner_email, file_id=id, error=%e, "download_not_found_db");
+            ApiError::not_found("Fichier introuvable")
         })?;
 
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
     if owner != owner_email {
-        warn!(user=%owner_email, file_id=id, "download_forbidden");
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Accès interdit : ce fichier ne vous appartient pas".to_string(),
-        ));
+        warn!(user=%owner_email, file_id=id, "download_hidden_not_owner");
+        return Err(ApiError::not_found("fichier introuvable"));
     }
-
+    // ouvrir le fichier sur disque
     let safe_name = Path::new(&filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -312,18 +345,11 @@ pub async fn download_handler(
 
     let file = tokio::fs::File::open(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            (
-                StatusCode::NOT_FOUND,
-                format!(
-                    "Fichier absent sur disque (id={id}) path={}",
-                    path.display()
-                ),
-            )
+            warn!(%ip, owner=%owner_email, file_id=id, path=%path.display(), "download_not_found_disk");
+            ApiError::not_found("Fichier absent sur disque")
         } else {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Erreur ouverture fichier: {e} path={}", path.display()),
-            )
+            error!(%ip, owner=%owner_email, file_id=id, error=%e, path=%path.display(), "download_open_error");
+            ApiError::internal()
         }
     })?;
 
@@ -339,50 +365,52 @@ pub async fn download_handler(
         )
         .body(body)
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Erreur création réponse: {e}"),
-            )
+            error!(%ip, owner=%owner_email, file_id=id, error=%e, "download_response_build_error");
+            ApiError::internal()
         })?;
 
-    info!(owner=%owner_email, file_id=id, filename=%filename, "download_ok");
+    info!(%ip, owner=%owner_email, file_id=id, filename=%filename, "download_ok");
     Ok(resp)
 }
 
 // ======================
-// DELETE FICHIER
+// DELETE
 // ======================
+
 pub async fn delete_handler(
     headers: HeaderMap,
-    Extension(user): Extension<AuthUser>,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<i64>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+) -> ApiResult<Json<serde_json::Value>> {
     let ip = client_ip(&headers);
-    let owner_email = user.email;
 
+    let owner_email = match get_user_from_headers(&headers) {
+        Ok(email) => email,
+        Err(msg) => {
+            warn!(%ip, %msg, "delete_unauthorized");
+            return Err(ApiError::unauthorized());
+        }
+    };
+
+    // Récupérer filename + owner dans la DB
     let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
         .bind(id)
         .fetch_one(&state.db)
         .await
         .map_err(|e| {
-            (
-                StatusCode::NOT_FOUND,
-                format!("Fichier id {id} introuvable: {e}"),
-            )
+            warn!(%ip, owner=%owner_email, file_id=id, error=%e, "delete_not_found_db");
+            ApiError::not_found("Fichier introuvable")
         })?;
 
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
+    // Vérifier appartenance
     if owner != owner_email {
-        warn!(%ip, owner=%owner_email, file_owner=%owner, file_id=id, "delete_forbidden");
-        return Err((
-            StatusCode::FORBIDDEN,
-            "Accès interdit : ce fichier ne vous appartient pas".to_string(),
-        ));
+        warn!(%ip, owner=%owner_email, file_id=id, "delete_hidden_not_owner");
+        return Err(ApiError::not_found("fichier introuvable"));
     }
-
+    // Supprimer sur disque
     let safe_name = Path::new(&filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -393,22 +421,19 @@ pub async fn delete_handler(
 
     if let Err(e) = tokio::fs::remove_file(&path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Erreur suppression fichier sur disque: {e}"),
-            ));
+            error!(%ip, owner=%owner_email, file_id=id, error=%e, path=%path.display(), "delete_disk_error");
+            return Err(ApiError::internal());
         }
     }
 
+    // Supprimer DB
     sqlx::query(r#"DELETE FROM files WHERE id = ?1"#)
         .bind(id)
         .execute(&state.db)
         .await
         .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Erreur DB (delete): {e}"),
-            )
+            error!(%ip, owner=%owner_email, file_id=id, error=%e, "delete_db_error");
+            ApiError::internal()
         })?;
 
     info!(%ip, owner=%owner_email, file_id=id, filename=%filename, "delete_ok");
@@ -419,4 +444,38 @@ pub async fn delete_handler(
         "filename": filename,
         "owner": owner_email,
     })))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forbidden_extensions_work() {
+        assert!(is_forbidden_extension("virus.exe"));
+        assert!(is_forbidden_extension("payload.DLL"));
+        assert!(is_forbidden_extension("script.sh"));
+        assert!(!is_forbidden_extension("photo.png"));
+        assert!(!is_forbidden_extension("note.txt"));
+    }
+
+    #[test]
+    fn basic_scan_blocks_mz_exe_signature() {
+        let data = b"MZ....fake";
+        let r = basic_malware_scan("ok.txt", data);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn basic_scan_blocks_shell_shebang() {
+        let data = b"#!/bin/bash\necho hi";
+        let r = basic_malware_scan("ok.txt", data);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn basic_scan_allows_normal_text() {
+        let data = b"hello world";
+        let r = basic_malware_scan("readme.txt", data);
+        assert!(r.is_ok());
+    }
 }

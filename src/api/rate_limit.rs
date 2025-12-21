@@ -1,51 +1,16 @@
-use axum::{
-    body::Body,
-    extract::State,
-    http::{HeaderMap, Request},
-    middleware::Next,
-    response::{IntoResponse, Response},
-};
+use axum::http::HeaderMap;
 use dashmap::DashMap;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-use tracing::warn;
+use once_cell::sync::Lazy;
+use std::time::{Duration, Instant};
 
-use crate::api::error::ApiError;
+use crate::api::error::{ApiError, ApiResult};
 
-#[derive(Clone)]
-pub struct RateLimiter {
-    map: Arc<DashMap<String, (u32, Instant)>>,
-}
+static RL: Lazy<DashMap<String, Bucket>> = Lazy::new(DashMap::new);
 
-impl RateLimiter {
-    pub fn new() -> Self {
-        Self {
-            map: Arc::new(DashMap::new()),
-        }
-    }
-
-    fn hit(&self, key: String, max: u32, window: Duration) -> Result<(), ApiError> {
-        let now = Instant::now();
-        let mut entry = self.map.entry(key).or_insert((0, now));
-        let (count, start) = entry.value_mut();
-
-        if now.duration_since(*start) > window {
-            *count = 0;
-            *start = now;
-        }
-
-        *count += 1;
-
-        if *count > max {
-            return Err(ApiError::rate_limited(
-                "RATE_LIMIT: trop de requêtes, réessaie plus tard",
-            ));
-        }
-
-        Ok(())
-    }
+#[derive(Clone, Debug)]
+struct Bucket {
+    count: u32,
+    window_start: Instant,
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
@@ -61,31 +26,74 @@ fn client_ip(headers: &HeaderMap) -> String {
     "unknown".to_string()
 }
 
-pub async fn rate_limit_mw(
-    State(limiter): State<RateLimiter>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let path = req.uri().path().to_string();
-    let ip = client_ip(req.headers());
+/// Rate limit mémoire: (ip + key) -> limit par fenêtre.
+/// Retourne ApiError::rate_limited si dépassé.
+pub fn rate_limit_or_err(
+    headers: &HeaderMap,
+    key: &str,
+    limit: u32,
+    window: Duration,
+) -> ApiResult<()> {
+    let ip = client_ip(headers);
+    let k = format!("{key}:{ip}");
+    let now = Instant::now();
 
-    let (max, window) = if path.starts_with("/auth/login") {
-        (5, Duration::from_secs(60))
-    } else if path.starts_with("/auth/register") {
-        (3, Duration::from_secs(60))
-    } else if path.starts_with("/files/upload") {
-        (10, Duration::from_secs(600))
-    } else if path.starts_with("/files/") {
-        (60, Duration::from_secs(60))
-    } else {
-        (120, Duration::from_secs(60))
-    };
+    let mut entry = RL.entry(k).or_insert(Bucket {
+        count: 0,
+        window_start: now,
+    });
 
-    let key = format!("{ip}|{path}");
-    if let Err(e) = limiter.hit(key, max, window) {
-        warn!(ip = %ip, path = %path, max = max, window_secs = window.as_secs(), "rate_limited");
-        return e.into_response();
+    // reset fenêtre si expirée
+    if now.duration_since(entry.window_start) >= window {
+        entry.window_start = now;
+        entry.count = 0;
     }
 
-    next.run(req).await
+    entry.count += 1;
+
+    if entry.count > limit {
+        return Err(ApiError::rate_limited(
+            "Trop de tentatives. Réessaie dans une minute.",
+        ));
+    }
+
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderMap, StatusCode};
+
+    fn headers_with_ip(ip: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-forwarded-for", ip.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn rate_limit_blocks_after_limit() {
+        let headers = headers_with_ip("1.2.3.4");
+
+        // limit=3 sur 60s => 4ème doit bloquer
+        assert!(rate_limit_or_err(&headers, "upload", 3, Duration::from_secs(60)).is_ok());
+        assert!(rate_limit_or_err(&headers, "upload", 3, Duration::from_secs(60)).is_ok());
+        assert!(rate_limit_or_err(&headers, "upload", 3, Duration::from_secs(60)).is_ok());
+
+        let err = rate_limit_or_err(&headers, "upload", 3, Duration::from_secs(60)).unwrap_err();
+
+        // err est un ApiError
+        assert_eq!(err.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn rate_limit_is_per_key() {
+        let headers = headers_with_ip("9.9.9.9");
+
+        for _ in 0..3 {
+            assert!(rate_limit_or_err(&headers, "login", 3, Duration::from_secs(60)).is_ok());
+        }
+
+        // upload doit rester OK car clé différente
+        assert!(rate_limit_or_err(&headers, "upload", 3, Duration::from_secs(60)).is_ok());
+    }
 }
