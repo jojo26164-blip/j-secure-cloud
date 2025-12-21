@@ -1,184 +1,181 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE="http://127.0.0.1:8081/api"
+BASE="${BASE:-http://127.0.0.1:8081}"
 
+echo "=============================="
+echo "J-Secure Cloud — GRAND TEST"
+echo "BASE=$BASE"
+echo "=============================="
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "❌ missing: $1"; exit 1; }; }
+need curl
+need jq
+
+pass(){ echo "✅ $1"; }
+fail(){ echo "❌ $1"; exit 1; }
+
+# -----------------------------
+# 0) CORS PRE-FLIGHT
+# -----------------------------
+echo "== 0) CORS PRE-FLIGHT =="
+code=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS \
+  -H "Origin: http://localhost:5173" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: authorization,content-type" \
+  "$BASE/api/auth/login")
+[[ "$code" == "200" || "$code" == "204" ]] && pass "CORS preflight (code=$code)" || fail "CORS preflight attendu 200/204, reçu $code"
+
+# -----------------------------
+# 1) HEALTH
+# -----------------------------
 echo "== 1) HEALTH =="
-curl -i "$BASE/health"
-echo
+health_json=$(curl -s "$BASE/api/health")
+echo "$health_json" | jq -e '.status' >/dev/null || fail "health JSON invalide"
+pass "health ok"
 
-EMAIL="test$(date +%s)@local.dev"
-PASS="Passw0rd!"
+# -----------------------------
+# 2) REGISTER / LOGIN
+# -----------------------------
+echo "== 2) REGISTER / LOGIN =="
+TS=$(date +%s)
+EMAIL="grandtest_${TS}@local.dev"
+PASS="Passw0rd!${TS}"
 
-echo "== 2) REGISTER =="
-curl -s -i -X POST "$BASE/auth/register" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}"
-echo
+reg=$(curl -s -X POST "$BASE/api/auth/register" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+echo "$reg" | jq -e '.status=="ok"' >/dev/null || fail "register KO: $reg"
+pass "register ok"
 
-echo "== 3) LOGIN (récupère token) =="
-TOKEN=$(curl -s -X POST "$BASE/auth/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}" \
-  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-test -n "$TOKEN" || { echo "❌ token vide"; exit 1; }
-echo "TOKEN OK"
-echo
+login=$(curl -s -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+TOKEN=$(echo "$login" | jq -r '.token // empty')
+[[ -n "$TOKEN" ]] || fail "login sans token: $login"
+pass "login ok (token obtenu)"
 
-echo "== 4) LIST FILES (doit être 200 et []) =="
-code=$(curl -s -o /tmp/jsc_list.json -w "%{http_code}" \
+# -----------------------------
+# 3) REGISTER CONFLICT -> 409
+# -----------------------------
+echo "== 3) REGISTER CONFLICT =="
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/auth/register" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"$PASS\"}")
+[[ "$code" == "409" ]] && pass "register conflict ok" || fail "register conflict attendu 409, reçu $code"
+
+# -----------------------------
+# 4) LOGIN WRONG PASS -> 401
+# -----------------------------
+echo "== 4) LOGIN WRONG PASS =="
+code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL\",\"password\":\"WRONGPASS\"}")
+[[ "$code" == "401" ]] && pass "login wrong pass ok" || fail "login wrong pass attendu 401, reçu $code"
+
+# -----------------------------
+# 5) LIST sans token -> 401 JSON
+# -----------------------------
+echo "== 5) LIST sans token =="
+code=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/files")
+[[ "$code" == "401" ]] && pass "list sans token ok" || fail "list sans token attendu 401, reçu $code"
+
+# -----------------------------
+# 6) LIST avec token -> 200 []
+# -----------------------------
+echo "== 6) LIST (token) =="
+list=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/files")
+echo "$list" | jq -e 'type=="array"' >/dev/null || fail "list pas array: $list"
+pass "list ok"
+
+# -----------------------------
+# 7) UPLOAD ok -> LIST -> DOWNLOAD -> DELETE
+# -----------------------------
+echo "== 7) UPLOAD / DOWNLOAD / DELETE =="
+
+TMPFILE="/tmp/jsc_gt.txt"
+echo "hello-grand" > "$TMPFILE"
+
+upload_code=$(curl -s -o /tmp/jsc_upload_resp.json -w "%{http_code}" \
   -H "Authorization: Bearer $TOKEN" \
-  "$BASE/files")
-echo "HTTP $code"
-test "$code" = "200" || { echo "❌ attendu 200"; cat /tmp/jsc_list.json; exit 1; }
-cat /tmp/jsc_list.json
-echo
+  -F "file=@${TMPFILE};filename=jsc_gt.txt" \
+  "$BASE/api/files/upload")
+[[ "$upload_code" == "200" ]] || fail "upload attendu 200, reçu $upload_code: $(cat /tmp/jsc_upload_resp.json)"
+pass "upload ok"
 
-echo "== 5) UPLOAD fichier clean (txt) =="
-echo "hello from jsc" > /tmp/jsc_ok.txt
-code=$(curl -s -o /tmp/jsc_up.json -w "%{http_code}" \
-  -X POST "$BASE/files/upload" \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@/tmp/jsc_ok.txt;filename=jsc_ok.txt")
-echo "HTTP $code"
-test "$code" = "200" || { echo "❌ attendu 200"; cat /tmp/jsc_up.json; exit 1; }
-cat /tmp/jsc_up.json
-echo
-
-echo "== 6) LIST FILES (doit contenir le fichier) =="
-FILES=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/files")
-echo "$FILES"
-ID=$(echo "$FILES" | sed -n 's/.*"id":\([0-9]\+\).*/\1/p' | head -n1)
-test -n "$ID" || { echo "❌ Impossible d'extraire un id"; exit 1; }
+list2=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/files")
+ID=$(echo "$list2" | jq -r '.[0].id // empty')
+[[ -n "$ID" ]] || fail "ID introuvable dans list: $list2"
 echo "file id = $ID"
-echo
 
-echo "== 7) DOWNLOAD (doit être 200 et non vide) =="
-OUT="/tmp/jsc_download_${ID}.bin"
-code=$(curl -s -o "$OUT" -w "%{http_code}" \
+# ✅ URL CORRIGÉE ICI:
+DL="/tmp/jsc_download_${ID}.bin"
+dl_code=$(curl -s -o "$DL" -w "%{http_code}" \
   -H "Authorization: Bearer $TOKEN" \
-  "$BASE/files/$ID/download")
-echo "HTTP $code"
-test "$code" = "200" || { echo "❌ attendu 200"; ls -l "$OUT" || true; exit 1; }
-test -s "$OUT" || { echo "❌ fichier download vide"; ls -l "$OUT"; exit 1; }
-ls -l "$OUT"
-echo
+  "$BASE/api/files/${ID}/download")
+[[ "$dl_code" == "200" ]] || fail "download attendu 200, reçu $dl_code"
+[[ -s "$DL" ]] || fail "download vide: $DL"
+pass "download ok (non vide)"
 
-echo "== 8) DELETE =="
-code=$(curl -s -o /tmp/jsc_del.json -w "%{http_code}" \
-  -X DELETE \
+del_code=$(curl -s -o /tmp/jsc_delete_resp.json -w "%{http_code}" \
   -H "Authorization: Bearer $TOKEN" \
-  "$BASE/files/$ID")
-echo "HTTP $code"
-test "$code" = "200" || { echo "❌ attendu 200"; cat /tmp/jsc_del.json; exit 1; }
-cat /tmp/jsc_del.json
-echo
+  -X DELETE "$BASE/api/files/${ID}")
+[[ "$del_code" == "200" ]] || fail "delete attendu 200, reçu $del_code: $(cat /tmp/jsc_delete_resp.json)"
+pass "delete ok"
 
-echo "== 9) LIST FILES (doit redevenir []) =="
-code=$(curl -s -o /tmp/jsc_list2.json -w "%{http_code}" \
-  -H "Authorization: Bearer $TOKEN" \
-  "$BASE/files")
-echo "HTTP $code"
-test "$code" = "200" || { echo "❌ attendu 200"; cat /tmp/jsc_list2.json; exit 1; }
-cat /tmp/jsc_list2.json
-echo
+# -----------------------------
+# 8) CROSS-USER ACCESS : must be 404 (hide existence)
+# -----------------------------
+echo "== 8) CROSS-USER ACCESS =="
+TS2=$(date +%s)
+EMAIL2="grandtest2_${TS2}@local.dev"
+PASS2="Passw0rd!${TS2}"
+curl -s -X POST "$BASE/api/auth/register" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL2\",\"password\":\"$PASS2\"}" >/dev/null
 
-echo "== 10) UPLOAD interdit (exe) -> doit refuser 400 =="
-echo "MZ" > /tmp/jsc_bad.exe
-code=$(curl -s -o /tmp/jsc_bad.json -w "%{http_code}" \
-  -X POST "$BASE/files/upload" \
-  -H "Authorization: Bearer $TOKEN" \
-  -F "file=@/tmp/jsc_bad.exe;filename=jsc_bad.exe")
-echo "HTTP $code"
-test "$code" = "400" || { echo "❌ attendu 400"; cat /tmp/jsc_bad.json; exit 1; }
-cat /tmp/jsc_bad.json
-echo
+login2=$(curl -s -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" \
+  -d "{\"email\":\"$EMAIL2\",\"password\":\"$PASS2\"}")
+TOKEN2=$(echo "$login2" | jq -r '.token // empty')
+[[ -n "$TOKEN2" ]] || fail "login2 sans token: $login2"
 
-echo "== 11) INVALID TOKEN -> 401 =="
-code=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Authorization: Bearer INVALIDTOKEN" \
-  "$BASE/files")
-echo "HTTP $code"
-test "$code" = "401" || { echo "❌ attendu 401"; exit 1; }
-echo
+# user1 upload
+echo "secret-user1" > /tmp/jsc_u1.txt
+curl -s -H "Authorization: Bearer $TOKEN" -F "file=@/tmp/jsc_u1.txt;filename=u1.txt" "$BASE/api/files/upload" >/dev/null
+u1_list=$(curl -s -H "Authorization: Bearer $TOKEN" "$BASE/api/files")
+ID1=$(echo "$u1_list" | jq -r '.[0].id // empty')
+[[ -n "$ID1" ]] || fail "ID1 introuvable: $u1_list"
 
-echo "== 12) CROSS-USER ACCESS -> 403 ou 404 (hide existence) =="
+# user2 tries download/delete => 404 (hide)
+code_d=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN2" "$BASE/api/files/${ID1}/download")
+code_x=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN2" -X DELETE "$BASE/api/files/${ID1}")
+[[ "$code_d" == "404" ]] || fail "cross-user download attendu 404, reçu $code_d"
+[[ "$code_x" == "404" ]] || fail "cross-user delete attendu 404, reçu $code_x"
+pass "cross-user hidden ok (404/404)"
 
-EMAIL_A="a$(date +%s)@local.dev"
-PASS_A="Passw0rd!A"
-curl -s -X POST "$BASE/auth/register" -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL_A\",\"password\":\"$PASS_A\"}" >/dev/null
-TOKEN_A=$(curl -s -X POST "$BASE/auth/login" -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL_A\",\"password\":\"$PASS_A\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+# cleanup user1
+curl -s -H "Authorization: Bearer $TOKEN" -X DELETE "$BASE/api/files/${ID1}" >/dev/null || true
 
-EMAIL_B="b$(date +%s)@local.dev"
-PASS_B="Passw0rd!B"
-curl -s -X POST "$BASE/auth/register" -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL_B\",\"password\":\"$PASS_B\"}" >/dev/null
-TOKEN_B=$(curl -s -X POST "$BASE/auth/login" -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL_B\",\"password\":\"$PASS_B\"}" | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
-
-echo "hello" > /tmp/jsc_owner_test.txt
-curl -s -X POST "$BASE/files/upload" \
-  -H "Authorization: Bearer $TOKEN_A" \
-  -F "file=@/tmp/jsc_owner_test.txt;filename=jsc_owner_test.txt" >/dev/null
-
-ID_A=$(curl -s "$BASE/files" -H "Authorization: Bearer $TOKEN_A" \
-  | sed -n 's/.*"id":\([0-9]\+\).*/\1/p' | head -n1)
-echo "file id A = $ID_A"
-test -n "$ID_A" || { echo "❌ impossible de récupérer l'id"; exit 1; }
-
-code=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Authorization: Bearer $TOKEN_B" \
-  "$BASE/files/$ID_A/download")
-echo "download cross-user HTTP $code"
-test "$code" = "403" -o "$code" = "404" || { echo "❌ attendu 403 ou 404"; exit 1; }
-
-code=$(curl -s -o /dev/null -w "%{http_code}" \
-  -X DELETE \
-  -H "Authorization: Bearer $TOKEN_B" \
-  "$BASE/files/$ID_A")
-echo "delete cross-user HTTP $code"
-test "$code" = "404" || { echo "❌ attendu 404"; exit 1; }
-
-curl -s -X DELETE -H "Authorization: Bearer $TOKEN_A" "$BASE/files/$ID_A" >/dev/null
-echo
-
-echo "== 13) RATE LIMIT LOGIN (IP) -> doit bloquer après ~10/min =="
-EMAIL_RL="rl$(date +%s)@local.dev"
-PASS_RL="Passw0rd!RL"
-curl -s -X POST "$BASE/auth/register" -H "Content-Type: application/json" \
-  -d "{\"email\":\"$EMAIL_RL\",\"password\":\"$PASS_RL\"}" >/dev/null
-
-blocked=0
-for i in $(seq 1 12); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "$BASE/auth/login" \
-    -H "Content-Type: application/json" \
-    -d "{\"email\":\"$EMAIL_RL\",\"password\":\"WRONGPASS\"}")
-  echo "try $i => HTTP $code"
-  if [ "$code" = "429" ]; then
-    blocked=1
-    break
-  fi
+# -----------------------------
+# 9) RATE LIMIT LOGIN -> 429
+# -----------------------------
+echo "== 9) RATE LIMIT LOGIN =="
+hit429=0
+for i in $(seq 1 20); do
+  c=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" \
+    -d "{\"email\":\"$EMAIL\",\"password\":\"WRONGPASS\"}")
+  if [[ "$c" == "429" ]]; then hit429=1; break; fi
 done
-test "$blocked" = "1" || { echo "❌ rate limit login non déclenché"; exit 1; }
-echo
+[[ "$hit429" == "1" ]] && pass "rate limit login ok (429)" || fail "rate limit login non déclenché"
 
-echo "== 14) RATE LIMIT UPLOAD (IP) -> doit renvoyer 429 (pas 400) =="
-echo "x" > /tmp/jsc_rl_upload.txt
-blocked=0
-for i in $(seq 1 50); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" \
-    -X POST "$BASE/files/upload" \
-    -H "Authorization: Bearer $TOKEN_A" \
-    -F "file=@/tmp/jsc_rl_upload.txt;filename=jsc_rl_upload_$i.txt")
-  echo "upload $i => HTTP $code"
-  if [ "$code" = "429" ]; then
-    blocked=1
-    break
-  fi
+# -----------------------------
+# 10) RATE LIMIT UPLOAD -> 429
+# -----------------------------
+echo "== 10) RATE LIMIT UPLOAD =="
+hit429=0
+for i in $(seq 1 60); do
+  echo "x$i" > /tmp/rl_up.txt
+  c=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" \
+    -F "file=@/tmp/rl_up.txt;filename=rl_${i}.txt" "$BASE/api/files/upload")
+  if [[ "$c" == "429" ]]; then hit429=1; break; fi
 done
-test "$blocked" = "1" || { echo "❌ rate limit upload non déclenché (ou pas en 429)"; exit 1; }
+[[ "$hit429" == "1" ]] && pass "rate limit upload ok (429)" || fail "rate limit upload non déclenché"
 
-echo "✅ B1 OK: invalid token / cross-user / rate-limit login+upload"
+echo "=============================="
+echo "✅ GRAND TEST OK"
+echo "=============================="

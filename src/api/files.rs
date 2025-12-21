@@ -2,24 +2,20 @@ use axum::{
     body::Body,
     extract::{Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     Json,
 };
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-use tokio_util::io::ReaderStream;
-
 use sqlx::Row;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tracing::{error, info, warn};
 
 use crate::api::auth::get_user_from_headers;
 use crate::api::error::{ApiError, ApiResult};
-use crate::api::AppState;
-
 use crate::api::rate_limit::rate_limit_or_err;
-use std::time::Duration;
+use crate::api::AppState;
 
 // ======================
 // Helpers
@@ -36,7 +32,6 @@ async fn scan_with_clamav(data: &[u8]) -> Result<(), String> {
         .await
         .map_err(|e| format!("Erreur envoi INSTREAM: {e}"))?;
 
-    // chunks: [len(4 bytes BE)] + data
     for chunk in data.chunks(8192) {
         let len = (chunk.len() as u32).to_be_bytes();
         stream.write_all(&len).await.map_err(|e| e.to_string())?;
@@ -192,10 +187,10 @@ pub async fn upload_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> ApiResult<impl IntoResponse> {
+) -> ApiResult<Json<UploadResponse>> {
     let ip = client_ip(&headers);
 
-    // ✅ Rate limit IP upload (ex: 30/min)
+    // ✅ Rate limit IP upload (30/min)
     rate_limit_or_err(&headers, "upload", 30, Duration::from_secs(60))?;
 
     let owner_email = match get_user_from_headers(&headers) {
@@ -234,22 +229,22 @@ pub async fn upload_handler(
 
     info!(%ip, owner=%owner_email, file=%filename, size=bytes.len(), "upload_received");
 
+    // 🔒 extensions interdites (rapide)
+    if is_forbidden_extension(&filename) {
+        warn!(%ip, owner=%owner_email, file=%filename, "upload_blocked_forbidden_extension");
+        return Err(ApiError::file_refused());
+    }
+
+    // 🔍 scan basique (rapide)
+    if let Err(reason) = basic_malware_scan(&filename, &bytes) {
+        warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_blocked_basic_scan");
+        return Err(ApiError::virus_detected());
+    }
+
     // ✅ Scan ClamAV AVANT enregistrement
     if let Err(reason) = scan_with_clamav(&bytes).await {
         warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_blocked_clamav");
-        return Err(ApiError::bad_request(format!("CLAMAV_FAIL: {reason}")));
-    }
-
-    // 🔒 extensions interdites
-    if is_forbidden_extension(&filename) {
-        warn!(%ip, owner=%owner_email, file=%filename, "upload_blocked_forbidden_extension");
-        return Err(ApiError::bad_request("type de fichier interdit"));
-    }
-
-    // 🔍 scan basique
-    if let Err(reason) = basic_malware_scan(&filename, &bytes) {
-        warn!(%ip, owner=%owner_email, file=%filename, %reason, "upload_blocked_basic_scan");
-        return Err(ApiError::bad_request("virus détecté"));
+        return Err(ApiError::virus_detected());
     }
 
     let size_bytes = bytes.len() as i64;
@@ -271,7 +266,8 @@ pub async fn upload_handler(
     let file_path = upload_dir.join(&safe_name);
 
     tokio::fs::write(&file_path, &bytes).await.map_err(|e| {
-        ApiError::bad_request(format!("DISK_WRITE_FAIL: {e} path={}", file_path.display()))
+        error!(%ip, owner=%owner_email, file=%safe_name, error=%e, path=%file_path.display(), "upload_write_failed");
+        ApiError::internal()
     })?;
 
     // insert DB
@@ -286,7 +282,10 @@ pub async fn upload_handler(
     .bind(size_bytes)
     .execute(&state.db)
     .await
-    .map_err(|e| ApiError::bad_request(format!("DB_INSERT_FAIL: {e}")))?;
+    .map_err(|e| {
+        error!(%ip, owner=%owner_email, file=%safe_name, error=%e, "upload_db_insert_failed");
+        ApiError::internal()
+    })?;
 
     info!(%ip, owner=%owner_email, file=%safe_name, size_bytes=size_bytes, "upload_ok");
 
@@ -330,10 +329,12 @@ pub async fn download_handler(
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
+    // hide existence si pas owner
     if owner != owner_email {
-        warn!(user=%owner_email, file_id=id, "download_hidden_not_owner");
-        return Err(ApiError::not_found("fichier introuvable"));
+        warn!(%ip, user=%owner_email, file_id=id, "download_hidden_not_owner");
+        return Err(ApiError::not_found("Fichier introuvable"));
     }
+
     // ouvrir le fichier sur disque
     let safe_name = Path::new(&filename)
         .file_name()
@@ -343,18 +344,16 @@ pub async fn download_handler(
 
     let path = uploads_dir().join(&safe_name);
 
-    let file = tokio::fs::File::open(&path).await.map_err(|e| {
+    // lire le fichier en mémoire (B4 – fiable)
+    let bytes = tokio::fs::read(&path).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             warn!(%ip, owner=%owner_email, file_id=id, path=%path.display(), "download_not_found_disk");
-            ApiError::not_found("Fichier absent sur disque")
+            ApiError::not_found("Fichier introuvable")
         } else {
-            error!(%ip, owner=%owner_email, file_id=id, error=%e, path=%path.display(), "download_open_error");
+            error!(%ip, owner=%owner_email, file_id=id, error=%e, path=%path.display(), "download_read_error");
             ApiError::internal()
         }
     })?;
-
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
 
     let resp = Response::builder()
         .status(StatusCode::OK)
@@ -363,13 +362,9 @@ pub async fn download_handler(
             "Content-Disposition",
             format!("attachment; filename=\"{}\"", filename),
         )
-        .body(body)
-        .map_err(|e| {
-            error!(%ip, owner=%owner_email, file_id=id, error=%e, "download_response_build_error");
-            ApiError::internal()
-        })?;
+        .body(Body::from(bytes))
+        .map_err(|_| ApiError::internal())?;
 
-    info!(%ip, owner=%owner_email, file_id=id, filename=%filename, "download_ok");
     Ok(resp)
 }
 
@@ -392,7 +387,6 @@ pub async fn delete_handler(
         }
     };
 
-    // Récupérer filename + owner dans la DB
     let row = sqlx::query(r#"SELECT filename, owner FROM files WHERE id = ?1"#)
         .bind(id)
         .fetch_one(&state.db)
@@ -405,12 +399,13 @@ pub async fn delete_handler(
     let owner: String = row.try_get("owner").unwrap_or_default();
     let filename: String = row.try_get("filename").unwrap_or_default();
 
-    // Vérifier appartenance
+    // hide existence si pas owner
     if owner != owner_email {
         warn!(%ip, owner=%owner_email, file_id=id, "delete_hidden_not_owner");
-        return Err(ApiError::not_found("fichier introuvable"));
+        return Err(ApiError::not_found("Fichier introuvable"));
     }
-    // Supprimer sur disque
+
+    // supprimer disque
     let safe_name = Path::new(&filename)
         .file_name()
         .and_then(|s| s.to_str())
@@ -418,7 +413,6 @@ pub async fn delete_handler(
         .to_string();
 
     let path = uploads_dir().join(&safe_name);
-
     if let Err(e) = tokio::fs::remove_file(&path).await {
         if e.kind() != std::io::ErrorKind::NotFound {
             error!(%ip, owner=%owner_email, file_id=id, error=%e, path=%path.display(), "delete_disk_error");
@@ -426,7 +420,7 @@ pub async fn delete_handler(
         }
     }
 
-    // Supprimer DB
+    // supprimer DB
     sqlx::query(r#"DELETE FROM files WHERE id = ?1"#)
         .bind(id)
         .execute(&state.db)
@@ -445,6 +439,11 @@ pub async fn delete_handler(
         "owner": owner_email,
     })))
 }
+
+// ======================
+// Tests
+// ======================
+
 #[cfg(test)]
 mod tests {
     use super::*;
