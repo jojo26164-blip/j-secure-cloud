@@ -1,11 +1,10 @@
 use axum::{
+    extract::DefaultBodyLimit,
+    http::{HeaderValue, Method},
     routing::{delete, get, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
-
-// ✅ IMPORTANT: pas "use http::..." -> ça t'a cassé
-use axum::http::{HeaderValue, Method};
 
 pub mod auth;
 pub mod error;
@@ -19,7 +18,6 @@ pub struct AppState {
 }
 
 fn cors_layer() -> CorsLayer {
-    // Exemple: "http://127.0.0.1:5500,http://localhost:5500,https://tondomaine.com"
     let origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
 
     if origins.trim().is_empty() {
@@ -50,6 +48,15 @@ fn cors_layer() -> CorsLayer {
 pub fn api_router(state: AppState) -> Router {
     let cors = cors_layer();
 
+    // ⚠️ Limite globale (large, pour ne pas casser les autres routes)
+    let body_limit = DefaultBodyLimit::max(64 * 1024 * 1024); // 64 MiB
+
+    // ✅ Limite upload contrôlée par env (B5)
+    let max_upload: usize = std::env::var("MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2 * 1024 * 1024); // 2 MiB par défaut
+
     let public = Router::new()
         .route("/health", get(health::health_handler))
         .route("/auth/login", post(auth::login_handler))
@@ -57,12 +64,17 @@ pub fn api_router(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/files", get(files::list_files_handler))
-        .route("/files/upload", post(files::upload_handler))
         .route("/files/:id/download", get(files::download_handler))
         .route("/files/:id", delete(files::delete_handler));
 
+    // ✅ Upload séparé + marge pour que Axum ne coupe pas avant ton 413
+    let upload = Router::new()
+        .route("/files/upload", post(files::upload_handler))
+        .layer(DefaultBodyLimit::max(max_upload + 1024 * 1024)); // +1MiB marge
+
     Router::new()
-        .nest("/api", public.merge(protected))
+        .nest("/api", public.merge(protected).merge(upload))
         .layer(cors)
+        .layer(body_limit)
         .with_state(state)
 }

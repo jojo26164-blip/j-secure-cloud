@@ -1,11 +1,8 @@
-#![allow(dead_code)]
-
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-
 use serde::Serialize;
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -33,6 +30,25 @@ impl ApiError {
         }
     }
 
+    // 413
+    pub fn payload_too_large(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE", message)
+    }
+
+    // 507
+    pub fn insufficient_storage(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "INSUFFICIENT_STORAGE",
+            message,
+        )
+    }
+
+    // 403 quota
+    pub fn quota_exceeded(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, "QUOTA_EXCEEDED", message)
+    }
+
     // 400
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, "BAD_REQUEST", message)
@@ -46,6 +62,7 @@ impl ApiError {
             "token manquant ou invalide",
         )
     }
+
     pub fn unauthorized_msg(message: impl Into<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "UNAUTHORIZED", message)
     }
@@ -78,11 +95,12 @@ impl ApiError {
             "erreur interne",
         )
     }
+
     pub fn internal_msg(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL", message)
     }
 
-    // Spécifiques fichiers
+    // Fichiers
     pub fn file_refused() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
@@ -106,7 +124,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-// Helper pour convertir facilement une erreur sqlx en ApiError
+// Helper sqlx
 pub fn db_err(context: &'static str, e: sqlx::Error) -> ApiError {
     ApiError::internal_msg(format!("Erreur DB ({context}): {e}"))
 }

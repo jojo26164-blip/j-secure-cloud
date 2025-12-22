@@ -25,6 +25,7 @@ clamav-client = "2.2.0"
 dashmap = "5"
 dotenvy = "0.15"
 anyhow = "1"
+nix = { version = "0.29", features = ["fs"] }
 
 [dev-dependencies]
 tower = "0.5"
