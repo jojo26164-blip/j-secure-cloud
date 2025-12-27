@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>J-Secure Cloud — Admin</title>
+  <style>
+    :root{
+      --bg:#020617; --panel:#0b1220; --panel2:#0f172a;
+      --text:#e5e7eb; --muted:#9ca3af; --border:#1f2937;
+      --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444;
+      --btn:#111827; --btn2:#0b1220; --shadow: 0 12px 30px rgba(0,0,0,.35);
+      --radius: 18px;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family: system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      background: radial-gradient(1200px 600px at 20% -10%, rgba(59,130,246,.25), transparent 60%),
+                  radial-gradient(900px 500px at 85% 0%, rgba(168,85,247,.18), transparent 55%),
+                  var(--bg);
+      color:var(--text);
+    }
+    .wrap{max-width:1100px;margin:0 auto;padding:22px}
+    .topbar{
+      display:flex; gap:12px; align-items:center; justify-content:space-between;
+      padding:14px 16px; border:1px solid var(--border); background: rgba(15,23,42,.6);
+      backdrop-filter: blur(10px); border-radius: var(--radius); box-shadow: var(--shadow);
+    }
+    .brand{display:flex; gap:12px; align-items:center}
+    .logo{
+      width:42px;height:42px;border-radius:14px;
+      background: linear-gradient(135deg, rgba(59,130,246,.9), rgba(168,85,247,.85));
+      box-shadow: 0 10px 24px rgba(59,130,246,.15);
+    }
+    h1{font-size:16px;margin:0}
+    .sub{font-size:12px;color:var(--muted);margin-top:2px}
+    .actions{display:flex; gap:10px; flex-wrap:wrap}
+    button, input, select{
+      font:inherit;
+      border-radius: 12px;
+      border:1px solid var(--border);
+      background: var(--btn);
+      color: var(--text);
+      padding:10px 12px;
+      outline:none;
+    }
+    button{cursor:pointer}
+    button:hover{filter:brightness(1.08)}
+    button:disabled{opacity:.55; cursor:not-allowed}
+    .btn-secondary{background: var(--btn2)}
+    .btn-danger{border-color: rgba(239,68,68,.4)}
+    .btn-ok{border-color: rgba(34,197,94,.35)}
+    .grid{
+      display:grid; grid-template-columns: 1fr; gap:14px; margin-top:14px;
+    }
+    @media(min-width: 980px){
+      .grid{grid-template-columns: 1.1fr .9fr}
+    }
+    .card{
+      border:1px solid var(--border);
+      background: rgba(11,18,32,.65);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding:14px;
+      overflow:hidden;
+    }
+    .card h2{margin:0 0 10px 0; font-size:14px; color:#e9efff}
+    .stats{
+      display:grid; gap:10px;
+      grid-template-columns: repeat(3, minmax(0,1fr));
+    }
+    .stat{
+      background: rgba(2,6,23,.6);
+      border:1px solid var(--border);
+      border-radius: 16px;
+      padding:12px;
+    }
+    .stat .k{font-size:12px;color:var(--muted)}
+    .stat .v{font-size:18px; font-weight:700; margin-top:6px}
+    .hint{color:var(--muted); font-size:12px; margin-top:10px; line-height:1.45}
+    .notice{
+      margin-top:12px;
+      padding:12px 12px;
+      border:1px solid var(--border);
+      border-radius: 14px;
+      background: rgba(2,6,23,.6);
+      display:flex; gap:10px; align-items:flex-start;
+    }
+    .dot{
+      width:10px;height:10px;border-radius:999px;background: var(--warn);
+      margin-top:5px; flex:0 0 auto;
+    }
+    .notice.ok .dot{background: var(--ok)}
+    .notice.bad .dot{background: var(--bad)}
+    .notice .t{font-weight:700; font-size:13px}
+    .notice .m{font-size:12px;color:var(--muted); margin-top:2px}
+    .row{display:flex; gap:10px; flex-wrap:wrap; align-items:center}
+    .searchRow{display:flex; gap:10px; align-items:center; flex-wrap:wrap}
+    .searchRow input{
+      flex: 1 1 260px;
+      background: rgba(2,6,23,.6);
+    }
+    table{width:100%; border-collapse: collapse; font-size:13px}
+    th, td{padding:10px 8px; border-bottom: 1px solid rgba(31,41,55,.9); vertical-align: middle}
+    th{color:var(--muted); text-align:left; font-weight:600}
+    tr:hover td{background: rgba(2,6,23,.35)}
+    .pill{
+      display:inline-flex; align-items:center; gap:6px;
+      padding:6px 10px; border-radius:999px;
+      border:1px solid var(--border);
+      background: rgba(2,6,23,.55);
+      font-size:12px;
+    }
+    .pill.ok{border-color: rgba(34,197,94,.35)}
+    .pill.bad{border-color: rgba(239,68,68,.35)}
+    .mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace}
+    .small{font-size:12px;color:var(--muted)}
+    .quotaBox{
+      display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+    }
+    .quotaBox input{width:140px; background: rgba(2,6,23,.6)}
+    .quotaBox select{background: rgba(2,6,23,.6)}
+    .rightActions{display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end}
+    .errBox{
+      margin-top:10px;
+      padding:10px 12px;
+      border-radius:14px;
+      border:1px solid rgba(239,68,68,.35);
+      background: rgba(127,29,29,.22);
+      color:#fecaca;
+      font-size:12px;
+      white-space: pre-wrap;
+      display:none;
+    }
+    .footer{margin-top:14px; color:var(--muted); font-size:12px}
+    a{color:#93c5fd; text-decoration:none}
+    a:hover{text-decoration:underline}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <h1>J-Secure Cloud — Admin</h1>
+        <div class="sub">Même session que le Dashboard (cookie <span class="mono">jwt</span>)</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn-secondary" id="btnOpenDash">Ouvrir Dashboard</button>
+      <button class="btn-secondary" id="btnRefresh">Rafraîchir</button>
+      <button class="btn-secondary" id="btnWhoami">Vérifier session</button>
+      <button class="btn-danger" id="btnLogout">Logout</button>
+    </div>
+  </div>
+
+  <div id="notice" class="notice">
+    <div class="dot"></div>
+    <div>
+      <div class="t" id="noticeTitle">Chargement…</div>
+      <div class="m" id="noticeMsg">Je vérifie si ton navigateur envoie bien le cookie admin.</div>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>Stats</h2>
+      <div class="stats">
+        <div class="stat">
+          <div class="k">Utilisateurs</div>
+          <div class="v" id="stUsers">—</div>
+        </div>
+        <div class="stat">
+          <div class="k">Fichiers</div>
+          <div class="v" id="stFiles">—</div>
+        </div>
+        <div class="stat">
+          <div class="k">Total stocké</div>
+          <div class="v" id="stBytes">—</div>
+        </div>
+      </div>
+
+      <div class="hint">
+        Si tu vois <b>403</b>, c’est presque toujours parce que le cookie <span class="mono">jwt</span>
+        n’est pas envoyé (ou tu n’es pas admin selon <span class="mono">ADMIN_EMAILS</span>).
+        <br/>Cette page n’utilise <b>aucun token manuel</b> : elle utilise <b>uniquement</b> le cookie.
+      </div>
+
+      <div class="errBox" id="errBox"></div>
+    </div>
+
+    <div class="card">
+      <h2>Actions rapides</h2>
+
+      <div class="searchRow">
+        <input id="searchEmail" placeholder="Filtrer par email (ex: admin@test.com)" />
+        <button id="btnClear" class="btn-secondary">Effacer</button>
+      </div>
+
+      <div class="row" style="margin-top:12px">
+        <span class="pill ok">✅ Cookie JWT requis</span>
+        <span class="pill">🔒 Admin only</span>
+        <span class="pill bad">⛔ Block empêche upload/download</span>
+      </div>
+
+      <div class="footer">
+        Astuce: ouvre d’abord <a href="dashboard.html" id="lnkDash">dashboard.html</a>, connecte-toi en admin,
+        puis reviens ici (même navigateur).
+      </div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="row" style="justify-content:space-between; align-items:flex-end">
+      <div>
+        <h2 style="margin:0">Utilisateurs</h2>
+        <div class="small">Liste (max 200) — Block/Unblock + Quota (en GiB/MiB/Ko) + effacer quota</div>
+      </div>
+      <div class="rightActions">
+        <button id="btnReloadUsers" class="btn-secondary">Recharger la liste</button>
+      </div>
+    </div>
+
+    <div style="overflow:auto; margin-top:10px">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:70px">ID</th>
+            <th>Email</th>
+            <th style="width:120px">Blocked</th>
+            <th style="width:220px">Quota</th>
+            <th style="width:360px">Actions</th>
+          </tr>
+        </thead>
+        <tbody id="tbodyUsers">
+          <tr><td colspan="5" class="small">Chargement…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div>
+
+<script>
+(() => {
+  const API_BASE = "/api";
+
+  const el = (id) => document.getElementById(id);
+
+  const notice = el("notice");
+  const noticeTitle = el("noticeTitle");
+  const noticeMsg = el("noticeMsg");
+  const errBox = el("errBox");
+
+  const stUsers = el("stUsers");
+  const stFiles = el("stFiles");
+  const stBytes = el("stBytes");
+
+  const tbodyUsers = el("tbodyUsers");
+  const searchEmail = el("searchEmail");
+
+  function setNotice(kind, title, msg) {
+    notice.classList.remove("ok","bad");
+    if (kind) notice.classList.add(kind);
+    noticeTitle.textContent = title;
+    noticeMsg.textContent = msg;
+  }
+
+  function showError(text) {
+    errBox.style.display = "block";
+    errBox.textContent = text;
+  }
+  function clearError() {
+    errBox.style.display = "none";
+    errBox.textContent = "";
+  }
+
+  function bytesToHuman(bytes) {
+    const n = Number(bytes || 0);
+    if (!isFinite(n) || n <= 0) return "0 B";
+    const units = ["B","KiB","MiB","GiB","TiB"];
+    let v = n, i = 0;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+  }
+
+  async function apiFetch(path, opts={}) {
+    // IMPORTANT: credentials include => envoie Cookie: jwt=...
+    const res = await fetch(API_BASE + path, {
+      ...opts,
+      headers: { "Accept":"application/json", ...(opts.headers || {}) },
+      credentials: "include",
+    });
+
+    // essaie JSON, sinon texte
+    let data = null;
+    const ct = res.headers.get("content-type") || "";
+    if (ct.includes("application/json")) {
+      try { data = await res.json(); } catch {}
+    } else {
+      try { data = await res.text(); } catch {}
+    }
+
+    if (!res.ok) {
+      const body = (typeof data === "string") ? data : JSON.stringify(data);
+      const msg = `HTTP ${res.status} ${res.statusText}\n${body || ""}`;
+      const err = new Error(msg);
+      err.status = res.status;
+      err.body = data;
+      throw err;
+    }
+    return data;
+  }
+
+  async function loadStats() {
+    const stats = await apiFetch("/admin/stats", { method: "GET" });
+    stUsers.textContent = String(stats.users_count ?? "—");
+    stFiles.textContent = String(stats.files_count ?? "—");
+    stBytes.textContent = bytesToHuman(stats.total_bytes ?? 0);
+  }
+
+  function renderUsersRows(users) {
+    const filter = (searchEmail.value || "").trim().toLowerCase();
+    const list = filter
+      ? users.filter(u => String(u.email || "").toLowerCase().includes(filter))
+      : users;
+
+    if (!list.length) {
+      tbodyUsers.innerHTML = `<tr><td colspan="5" class="small">Aucun user (filtre: "${filter}")</td></tr>`;
+      return;
+    }
+
+    tbodyUsers.innerHTML = "";
+    for (const u of list) {
+      const id = u.id ?? 0;
+      const email = u.email ?? "";
+      const blocked = Number(u.is_blocked ?? 0) === 1;
+      const quotaBytes = (u.quota_bytes === null || u.quota_bytes === undefined) ? null : Number(u.quota_bytes);
+
+      const tr = document.createElement("tr");
+
+      const tdId = document.createElement("td");
+      tdId.className = "mono";
+      tdId.textContent = id;
+
+      const tdEmail = document.createElement("td");
+      tdEmail.className = "mono";
+      tdEmail.textContent = email;
+
+      const tdBlocked = document.createElement("td");
+      tdBlocked.innerHTML = blocked
+        ? `<span class="pill bad">YES</span>`
+        : `<span class="pill ok">NO</span>`;
+
+      const tdQuota = document.createElement("td");
+      tdQuota.innerHTML = quotaBytes === null
+        ? `<span class="pill">NULL</span> <span class="small">(fallback env)</span>`
+        : `<span class="pill">${bytesToHuman(quotaBytes)}</span>`;
+
+      const tdActions = document.createElement("td");
+
+      // Quota editor (big enough)
+      const quotaBox = document.createElement("div");
+      quotaBox.className = "quotaBox";
+
+      const inp = document.createElement("input");
+      inp.type = "number";
+      inp.min = "0";
+      inp.step = "1";
+      inp.placeholder = "Valeur";
+
+      const sel = document.createElement("select");
+      sel.innerHTML = `
+        <option value="GiB">GiB</option>
+        <option value="MiB">MiB</option>
+        <option value="KiB">KiB</option>
+        <option value="B">B</option>
+      `;
+
+      // prefill nice value
+      if (quotaBytes !== null && quotaBytes > 0) {
+        // show in GiB if possible
+        const gib = quotaBytes / (1024*1024*1024);
+        if (gib >= 1 && Number.isFinite(gib)) {
+          sel.value = "GiB";
+          inp.value = Math.round(gib);
+        } else {
+          const mib = quotaBytes / (1024*1024);
+          sel.value = "MiB";
+          inp.value = Math.round(mib);
+        }
+      }
+
+      const btnSet = document.createElement("button");
+      btnSet.textContent = "Set quota";
+      btnSet.className = "btn-ok";
+
+      const btnClear = document.createElement("button");
+      btnClear.textContent = "Clear quota";
+      btnClear.className = "btn-secondary";
+
+      const btnBlock = document.createElement("button");
+      btnBlock.textContent = blocked ? "Unblock" : "Block";
+      btnBlock.className = blocked ? "btn-secondary" : "btn-danger";
+
+      const status = document.createElement("span");
+      status.className = "small";
+      status.style.marginLeft = "6px";
+      status.textContent = "";
+
+      quotaBox.appendChild(inp);
+      quotaBox.appendChild(sel);
+      quotaBox.appendChild(btnSet);
+      quotaBox.appendChild(btnClear);
+      quotaBox.appendChild(btnBlock);
+      quotaBox.appendChild(status);
+
+      tdActions.appendChild(quotaBox);
+
+      tr.appendChild(tdId);
+      tr.appendChild(tdEmail);
+      tr.appendChild(tdBlocked);
+      tr.appendChild(tdQuota);
+      tr.appendChild(tdActions);
+
+      // handlers
+      btnSet.onclick = async () => {
+        clearError();
+        status.textContent = "…";
+        btnSet.disabled = true;
+        try {
+          const v = (inp.value || "").trim();
+          if (!v) throw new Error("Valeur quota manquante.");
+          const n = Number(v);
+          if (!Number.isFinite(n) || n < 0) throw new Error("Valeur invalide.");
+
+          const unit = sel.value;
+          let bytes = n;
+          if (unit === "KiB") bytes = n * 1024;
+          if (unit === "MiB") bytes = n * 1024 * 1024;
+          if (unit === "GiB") bytes = n * 1024 * 1024 * 1024;
+
+          bytes = Math.floor(bytes);
+          await apiFetch(`/admin/users/${encodeURIComponent(email)}/quota`, {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ quota_bytes: bytes })
+          });
+          status.textContent = "✅ quota OK";
+          await refreshAll();
+        } catch (e) {
+          status.textContent = "❌";
+          showError(String(e.message || e));
+        } finally {
+          btnSet.disabled = false;
+          setTimeout(() => status.textContent = "", 2500);
+        }
+      };
+
+      btnClear.onclick = async () => {
+        clearError();
+        status.textContent = "…";
+        btnClear.disabled = true;
+        try {
+          await apiFetch(`/admin/users/${encodeURIComponent(email)}/quota`, {
+            method: "POST",
+            headers: {"Content-Type":"application/json"},
+            body: JSON.stringify({ quota_bytes: null })
+          });
+          status.textContent = "✅ cleared";
+          await refreshAll();
+        } catch (e) {
+          status.textContent = "❌";
+          showError(String(e.message || e));
+        } finally {
+          btnClear.disabled = false;
+          setTimeout(() => status.textContent = "", 2500);
+        }
+      };
+
+      btnBlock.onclick = async () => {
+        clearError();
+        status.textContent = "…";
+        btnBlock.disabled = true;
+        try {
+          if (blocked) {
+            await apiFetch(`/admin/users/${encodeURIComponent(email)}/unblock`, { method: "POST" });
+            status.textContent = "✅ unblocked";
+          } else {
+            await apiFetch(`/admin/users/${encodeURIComponent(email)}/block`, { method: "POST" });
+            status.textContent = "✅ blocked";
+          }
+          await refreshAll();
+        } catch (e) {
+          status.textContent = "❌";
+          showError(String(e.message || e));
+        } finally {
+          btnBlock.disabled = false;
+          setTimeout(() => status.textContent = "", 2500);
+        }
+      };
+
+      tbodyUsers.appendChild(tr);
+    }
+  }
+
+  async function loadUsers() {
+    const users = await apiFetch("/admin/users", { method: "GET" });
+    renderUsersRows(Array.isArray(users) ? users : []);
+  }
+
+  async function checkSession() {
+    // Optionnel: si tu as /api/me (tu l’as mentionné dans tes routes),
+    // sinon on test juste /admin/stats.
+    try {
+      clearError();
+      await loadStats();
+      setNotice("ok", "Session admin OK", "Cookie jwt envoyé + accès admin validé.");
+      return true;
+    } catch (e) {
+      const code = e.status || 0;
+      if (code === 401) {
+        setNotice("bad", "Non connecté (401)", "Va sur le Dashboard, connecte-toi, puis reviens ici.");
+      } else if (code === 403) {
+        setNotice("bad", "Interdit (403)", "Tu es connecté, mais pas reconnu admin (ADMIN_EMAILS) ou cookie non envoyé.");
+      } else {
+        setNotice("bad", "Erreur API", "Vérifie que le backend tourne et que /api/admin/* est accessible.");
+      }
+      showError(String(e.message || e));
+      return false;
+    }
+  }
+
+  async function refreshAll() {
+    const ok = await checkSession();
+    if (!ok) {
+      tbodyUsers.innerHTML = `<tr><td colspan="5" class="small">Pas d’accès admin pour charger la liste (voir message en haut).</td></tr>`;
+      return;
+    }
+    await Promise.all([loadStats(), loadUsers()]);
+  }
+
+  // UI events
+  el("btnRefresh").onclick = refreshAll;
+  el("btnReloadUsers").onclick = loadUsers;
+  el("btnWhoami").onclick = checkSession;
+  el("btnOpenDash").onclick = () => location.href = "dashboard.html";
+  el("btnClear").onclick = () => { searchEmail.value = ""; refreshAll(); };
+  el("lnkDash").onclick = (e) => { e.preventDefault(); location.href = "dashboard.html"; };
+
+  searchEmail.addEventListener("input", async () => {
+    // re-render only if already loaded
+    // simplest: reload users list then filter client-side
+    // but we keep current table by reloading (safe)
+    try { await loadUsers(); } catch {}
+  });
+
+  el("btnLogout").onclick = async () => {
+    clearError();
+    try {
+      // Si ton routeur expose /api/auth/logout
+      await apiFetch("/auth/logout", { method: "POST" }).catch(async () => {
+        // fallback si c’est GET
+        try { await apiFetch("/auth/logout", { method: "GET" }); } catch {}
+      });
+      setNotice("ok", "Déconnecté", "Cookie jwt supprimé. Reconnecte-toi sur le Dashboard.");
+      stUsers.textContent = stFiles.textContent = stBytes.textContent = "—";
+      tbodyUsers.innerHTML = `<tr><td colspan="5" class="small">Déconnecté.</td></tr>`;
+    } catch (e) {
+      showError(String(e.message || e));
+    }
+  };
+
+  // start
+  refreshAll();
+})();
+</script>
+</body>
+</html>

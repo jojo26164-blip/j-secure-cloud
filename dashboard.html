@@ -1,106 +1,340 @@
 <!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="utf-8" />
-  <title>J-Secure Cloud — Test</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>J-Secure Cloud — Dashboard</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; }
-    input, button { padding: 8px; margin: 6px 0; }
-    pre { background:#f5f5f5; padding:10px; overflow:auto; }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto; margin:0; background:#0b1220; color:#e5e7eb}
+    .wrap{max-width:1100px; margin:24px auto; padding:0 16px}
+    .card{background:#0f1a33; border:1px solid #1f2a44; border-radius:14px; padding:16px; margin-bottom:14px}
+    h1{font-size:22px; margin:0 0 10px}
+    h2{font-size:16px; margin:0 0 10px; color:#cbd5e1}
+    input,button{font:inherit}
+    input{background:#0b1220; color:#e5e7eb; border:1px solid #24314f; border-radius:10px; padding:10px; width:100%}
+    button{background:#1d4ed8; border:0; color:white; padding:10px 12px; border-radius:10px; cursor:pointer}
+    button.secondary{background:#334155}
+    button.danger{background:#b91c1c}
+    .row{display:grid; grid-template-columns:1fr 1fr; gap:10px}
+    .row3{display:grid; grid-template-columns:1fr 1fr 1fr; gap:10px}
+    .muted{color:#94a3b8; font-size:13px}
+    .ok{color:#22c55e}
+    .err{color:#ef4444; white-space:pre-wrap}
+    table{width:100%; border-collapse:collapse; font-size:14px}
+    th,td{padding:10px; border-bottom:1px solid #22304f; text-align:left}
+    .actions{display:flex; gap:8px; flex-wrap:wrap}
+    .pill{display:inline-block; padding:3px 8px; border:1px solid #2b3a5e; border-radius:999px; font-size:12px; color:#cbd5e1}
   </style>
 </head>
 <body>
-  <h2>J-Secure Cloud — Dashboard test (local)</h2>
+<div class="wrap">
+  <div class="card">
+    <h1>J-Secure Cloud — Dashboard</h1>
+    <div class="muted">API: <span class="pill" id="apiBase"></span></div>
+  </div>
 
-  <label>Email</label><br/>
-  <input id="email" value="test@example.com" /><br/>
+  <div class="card">
+    <h2>Connexion</h2>
+    <div class="row">
+      <div>
+        <label class="muted">Email</label>
+        <input id="email" placeholder="email@domaine.com"/>
+      </div>
+      <div>
+        <label class="muted">Mot de passe</label>
+        <input id="password" type="password" placeholder="********"/>
+      </div>
+    </div>
+    <div style="margin-top:10px" class="actions">
+      <button id="btnRegister">Register</button>
+      <button id="btnLogin">Login</button>
+      <button class="secondary" id="btnLogout">Logout</button>
+      <button class="secondary" id="btnHealth">Health</button>
+      <button class="secondary" id="btnRefresh">Refresh</button>
+    </div>
+    <div id="authMsg" class="muted" style="margin-top:10px"></div>
+    <div id="authErr" class="err" style="margin-top:10px"></div>
+  </div>
 
-  <label>Mot de passe</label><br/>
-  <input id="password" type="password" value="Test1234!" /><br/>
+  <div class="card">
+    <h2>Stockage ( /api/me )</h2>
+    <div id="meBox" class="muted">—</div>
+  </div>
 
-  <button id="btnLogin">Login</button>
-  <button id="btnLogout">Logout</button>
+  <div class="card">
+    <h2>Upload ( /api/files/upload )</h2>
+    <div class="row3">
+      <input id="fileInput" type="file"/>
+      <button id="btnUpload">Upload</button>
+      <div class="muted" id="uploadMsg">—</div>
+    </div>
+    <div id="uploadErr" class="err" style="margin-top:10px"></div>
+  </div>
 
-  <p><b>Token :</b></p>
-  <input id="token" style="width: 100%;" placeholder="(vide)" />
-
-  <hr/>
-
-  <h3>Upload</h3>
-  <input id="file" type="file" />
-  <button id="btnUpload">Upload</button>
-
-  <h3>Réponse</h3>
-  <pre id="out"></pre>
+  <div class="card">
+    <h2>Mes fichiers ( /api/files )</h2>
+    <div class="muted" id="filesMsg">—</div>
+    <div id="filesErr" class="err" style="margin-top:10px"></div>
+    <div style="overflow:auto; margin-top:10px">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Nom</th>
+            <th>Taille</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="filesTbody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 
 <script>
-  // ⚠️ IMPORTANT : ton API écoute sur 8081
-  const API = "http://127.0.0.1:8081";
+  // ===== Config =====
+  const API = "/api";
+  document.getElementById("apiBase").textContent = API;
 
-  const out = (x) => document.getElementById("out").textContent = x;
+  const $ = (id)=>document.getElementById(id);
 
-  function setToken(t) {
-    document.getElementById("token").value = t || "";
-    localStorage.setItem("js_token", t || "");
-  }
+  function setErr(el, msg){ el.textContent = msg || ""; }
+  function setMsg(el, msg){ el.textContent = msg || "—"; }
 
-  function getToken() {
-    return document.getElementById("token").value.trim() || localStorage.getItem("js_token") || "";
-  }
+  function getToken(){ return localStorage.getItem("js_token") || ""; }
+  function setToken(t){ localStorage.setItem("js_token", t); }
 
-  // Charge token si présent
-  setToken(localStorage.getItem("js_token") || "");
+  async function apiFetch(path, opts={}){
+    const headers = new Headers(opts.headers || {});
+    headers.set("Accept", "application/json");
 
-  document.getElementById("btnLogin").onclick = async () => {
-    out("Login en cours...");
-    const email = document.getElementById("email").value.trim();
-    const password = document.getElementById("password").value;
-
-    const res = await fetch(`${API}/auth/login`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password })
-    });
-
-    const txt = await res.text(); // on lit une seule fois (évite ton erreur "body already consumed")
-    out(`HTTP ${res.status}\n${txt}`);
-
-    // essaie d'extraire token
-    try {
-      const data = JSON.parse(txt);
-      if (data.token) setToken(data.token);
-    } catch {}
-  };
-
-  document.getElementById("btnLogout").onclick = () => {
-    setToken("");
-    out("Déconnecté.");
-  };
-
-  document.getElementById("btnUpload").onclick = async () => {
     const token = getToken();
-    if (!token) return out("❌ Pas de token. Fais Login d’abord.");
+    if (token) headers.set("Authorization", `Bearer ${token}`);
 
-    const fileInput = document.getElementById("file");
-    if (!fileInput.files || fileInput.files.length === 0) return out("❌ Choisis un fichier.");
+    // si body JSON, assure content-type
+    if (opts.json){
+      headers.set("Content-Type", "application/json");
+      opts.body = JSON.stringify(opts.json);
+    }
 
-    const form = new FormData();
-    form.append("file", fileInput.files[0]); // ⚠️ doit s’appeler "file" comme ton backend
+    const res = await fetch(API + path, { ...opts, headers });
 
-    out("Upload en cours...");
+    // essaie de lire JSON si possible
+    const ct = res.headers.get("content-type") || "";
+    let data = null;
+    if (ct.includes("application/json")){
+      try { data = await res.json(); } catch(e){ data = null; }
+    } else {
+      // parfois backend renvoie vide
+      try { data = await res.text(); } catch(e){ data = null; }
+    }
 
-    const res = await fetch(`${API}/files/upload`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${token}`
-        // ⚠️ NE PAS mettre Content-Type ici : fetch le fait pour multipart
-      },
-      body: form
-    });
+    if (!res.ok){
+      const msg = (data && data.message) ? data.message : (typeof data === "string" && data ? data : `${res.status} ${res.statusText}`);
+      throw new Error(msg);
+    }
+    return { res, data };
+  }
 
-    const txt = await res.text();
-    out(`HTTP ${res.status}\n${txt}`);
-  };
+  function fmtBytes(n){
+    const u=["B","KB","MB","GB","TB"]; let i=0; let x=Number(n||0);
+    while(x>=1024 && i<u.length-1){ x/=1024; i++; }
+    return `${x.toFixed(i===0?0:2)} ${u[i]}`;
+  }
+
+  // ===== Actions =====
+  async function doHealth(){
+    setErr($("authErr"),"");
+    try{
+      const {data} = await apiFetch("/health",{method:"GET"});
+      setMsg($("authMsg"), `Health OK: ${JSON.stringify(data)}`);
+    }catch(e){
+      setErr($("authErr"), "Health FAIL: " + e.message);
+    }
+  }
+
+  async function doRegister(){
+    setErr($("authErr"),"");
+    try{
+      const email=$("email").value.trim();
+      const password=$("password").value;
+      const {data} = await apiFetch("/auth/register",{method:"POST", json:{email,password}});
+      setMsg($("authMsg"), "Register OK");
+      if (data && data.token) setToken(data.token);
+      await refreshAll();
+    }catch(e){
+      setErr($("authErr"), "Register FAIL: " + e.message);
+    }
+  }
+
+  async function doLogin(){
+    setErr($("authErr"),"");
+    try{
+      const email=$("email").value.trim();
+      const password=$("password").value;
+      const {data} = await apiFetch("/auth/login",{method:"POST", json:{email,password}});
+      if (data && data.token){
+        setToken(data.token);
+        setMsg($("authMsg"), "Login OK");
+      } else {
+        setMsg($("authMsg"), "Login OK (no token?)");
+      }
+      await refreshAll();
+    }catch(e){
+      setErr($("authErr"), "Login FAIL: " + e.message);
+    }
+  }
+
+  function doLogout(){
+    setToken("");
+    setMsg($("authMsg"), "Logout OK");
+    $("meBox").textContent="—";
+    $("filesTbody").innerHTML="";
+  }
+
+  async function refreshMe(){
+    try{
+      const {data} = await apiFetch("/me",{method:"GET"});
+      $("meBox").innerHTML =
+        `<div><b>${data.email}</b></div>` +
+        `<div class="muted">Utilisé: ${fmtBytes(data.used_bytes)} / ${fmtBytes(data.max_bytes)} (${data.used_percent.toFixed(2)}%) • Fichiers: ${data.files_count}</div>`;
+    }catch(e){
+      $("meBox").innerHTML = `<span class="err">/me FAIL: ${e.message}</span>`;
+    }
+  }
+
+  async function refreshFiles(){
+    setErr($("filesErr"),"");
+    try{
+      const {data} = await apiFetch("/files",{method:"GET"});
+      if (!Array.isArray(data)){
+        throw new Error("Réponse /files n'est pas une liste (JSON). Regarde la réponse brute dans Network.");
+      }
+      setMsg($("filesMsg"), `${data.length} fichier(s)`);
+      const tbody = $("filesTbody");
+      tbody.innerHTML = "";
+      for (const f of data){
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${f.id ?? ""}</td>
+          <td>${escapeHtml(f.filename ?? "")}</td>
+          <td>${fmtBytes(f.size_bytes ?? 0)}</td>
+          <td>
+            <div class="actions">
+              <button class="secondary" data-dl="${f.id}">Download</button>
+              <button class="danger" data-del="${f.id}">Delete</button>
+            </div>
+          </td>`;
+        tbody.appendChild(tr);
+      }
+    }catch(e){
+      setErr($("filesErr"), "List FAIL: " + e.message);
+      setMsg($("filesMsg"), "—");
+    }
+  }
+
+  async function doUpload(){
+    setErr($("uploadErr"),"");
+    setMsg($("uploadMsg"), "Uploading...");
+    try{
+      const file = $("fileInput").files[0];
+      if (!file) throw new Error("Choisis un fichier.");
+      const fd = new FormData();
+      fd.append("file", file, file.name);
+
+      const token = getToken();
+      const headers = new Headers();
+      if (token) headers.set("Authorization", `Bearer ${token}`);
+
+      const res = await fetch(API + "/files/upload", { method:"POST", headers, body: fd });
+      const ct = res.headers.get("content-type") || "";
+      let data = null;
+      if (ct.includes("application/json")) data = await res.json().catch(()=>null);
+      if (!res.ok){
+        const msg = (data && data.message) ? data.message : `${res.status} ${res.statusText}`;
+        throw new Error(msg);
+      }
+      setMsg($("uploadMsg"), "Upload OK");
+      await refreshAll();
+    }catch(e){
+      setErr($("uploadErr"), "Upload FAIL: " + e.message);
+      setMsg($("uploadMsg"), "—");
+    }
+  }
+
+  // ✅ Download PROPRE: GET /api/files/:id/download
+  async function doDownload(id){
+    setErr($("filesErr"),"");
+    try{
+      const token = getToken();
+      const headers = new Headers();
+      if (token) headers.set("Authorization", `Bearer ${token}`);
+
+      const res = await fetch(API + `/files/${id}/download`, { method:"GET", headers });
+
+      if (!res.ok){
+        throw new Error(`${res.status} ${res.statusText}`);
+      }
+
+      // filename depuis Content-Disposition si présent
+      const cd = res.headers.get("content-disposition") || "";
+      let filename = `file_${id}`;
+      const m = cd.match(/filename="([^"]+)"/i);
+      if (m && m[1]) filename = m[1];
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }catch(e){
+      setErr($("filesErr"), "Download FAIL: " + e.message);
+    }
+  }
+
+  async function doDelete(id){
+    setErr($("filesErr"),"");
+    try{
+      await apiFetch(`/files/${id}`, { method:"DELETE" });
+      await refreshAll();
+    }catch(e){
+      setErr($("filesErr"), "Delete FAIL: " + e.message);
+    }
+  }
+
+  async function refreshAll(){
+    await refreshMe();
+    await refreshFiles();
+  }
+
+  function escapeHtml(s){
+    return String(s).replace(/[&<>"']/g, (c)=>({
+      "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
+    }[c]));
+  }
+
+  // events
+  $("btnHealth").onclick = doHealth;
+  $("btnRegister").onclick = doRegister;
+  $("btnLogin").onclick = doLogin;
+  $("btnLogout").onclick = doLogout;
+  $("btnRefresh").onclick = refreshAll;
+  $("btnUpload").onclick = doUpload;
+
+  $("filesTbody").addEventListener("click", (e)=>{
+    const dl = e.target.getAttribute("data-dl");
+    const del = e.target.getAttribute("data-del");
+    if (dl) doDownload(dl);
+    if (del) doDelete(del);
+  });
+
+  // auto refresh si token existe
+  if (getToken()) refreshAll();
 </script>
 </body>
 </html>

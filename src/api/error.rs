@@ -72,6 +72,10 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "FORBIDDEN", message)
     }
 
+    pub fn forbidden_default() -> Self {
+        Self::forbidden("forbidden")
+    }
+
     // 404
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", message)

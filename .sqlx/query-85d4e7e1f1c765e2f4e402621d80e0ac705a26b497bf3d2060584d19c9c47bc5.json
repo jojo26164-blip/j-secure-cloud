@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n    SELECT email, is_blocked\n    FROM users\n    ORDER BY email\n    LIMIT 100\n    ",
+  "describe": {
+    "columns": [
+      {
+        "name": "email",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "is_blocked",
+        "ordinal": 1,
+        "type_info": "Int64"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "85d4e7e1f1c765e2f4e402621d80e0ac705a26b497bf3d2060584d19c9c47bc5"
+}

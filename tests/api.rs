@@ -3,14 +3,19 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
-use sqlx::SqlitePool;
+use sqlx::sqlite::SqlitePoolOptions;
 use tower::ServiceExt; // oneshot
 
 use jsecure_cloud::api::{api_router, AppState};
 
 async fn setup_test_app() -> axum::Router {
     // DB SQLite en mémoire pour tests
-    let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+    // IMPORTANT: max_connections(1) pour éviter que sqlite::memory: soit "différent" selon la connexion
+    let db = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
 
     // Schéma minimal (adapte si ton projet a un migrate)
     sqlx::query(
@@ -18,7 +23,9 @@ async fn setup_test_app() -> axum::Router {
         CREATE TABLE users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT NOT NULL UNIQUE,
-            password_hash TEXT NOT NULL
+            password_hash TEXT NOT NULL,
+            is_blocked INTEGER DEFAULT 0,
+            quota_bytes INTEGER
         );
         CREATE TABLE files (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

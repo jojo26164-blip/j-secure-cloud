@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>J-Secure Cloud — Dashboard</title>
+  <style>
+    :root { color-scheme: dark; }
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;background:#0b1220;color:#e5e7eb}
+    .wrap{max-width:1050px;margin:24px auto;padding:0 14px}
+    .card{background:#0f172a;border:1px solid #22314b;border-radius:14px;padding:14px;margin:12px 0;box-shadow:0 10px 24px rgba(0,0,0,.25)}
+    h1{font-size:22px;margin:0 0 10px 0}
+    h2{font-size:16px;margin:0 0 10px 0;color:#cbd5e1}
+    .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+    input,button{border-radius:12px;border:1px solid #22314b;background:#0b1220;color:#e5e7eb;padding:10px 12px;font-size:14px}
+    input{min-width:220px}
+    button{cursor:pointer}
+    button.primary{background:#2563eb;border-color:#2563eb}
+    button.danger{background:#b91c1c;border-color:#b91c1c}
+    button.ghost{background:transparent}
+    .pill{display:inline-flex;align-items:center;gap:8px;padding:6px 10px;border-radius:999px;border:1px solid #22314b;background:#0b1220;color:#cbd5e1;font-size:13px}
+    .ok{color:#34d399}
+    .warn{color:#fbbf24}
+    .err{color:#f87171}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;white-space:pre-wrap}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:10px;border-bottom:1px solid #22314b;text-align:left;font-size:14px}
+    th{color:#cbd5e1;font-weight:600}
+    .right{text-align:right}
+    progress{width:100%;height:14px}
+    .small{font-size:12px;color:#94a3b8}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="row" style="justify-content:space-between;">
+    <h1>J-Secure Cloud — Dashboard</h1>
+    <div class="row">
+      <span class="pill" id="sessPill">Session: <b class="warn" id="sessTxt">…</b></span>
+      <button class="ghost" id="btnRefresh">Rafraîchir</button>
+      <button class="danger" id="btnLogout">Déconnecter (cookie)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Connexion</h2>
+    <div class="row">
+      <input id="email" placeholder="email" autocomplete="username"/>
+      <input id="password" placeholder="mot de passe" type="password" autocomplete="current-password"/>
+      <button class="primary" id="btnLogin">Se connecter</button>
+      <button id="btnRegister">Créer compte</button>
+      <button id="btnMe">/api/me</button>
+      <button id="btnHealth">/api/health</button>
+    </div>
+    <div class="small">JWT stocké en cookie HttpOnly. Le navigateur envoie automatiquement le cookie.</div>
+    <div class="mono" id="boxOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <h2>Upload</h2>
+    <div class="row">
+      <input id="file" type="file"/>
+      <button class="primary" id="btnUpload">UPLOAD (POST /api/files/upload)</button>
+    </div>
+    <progress id="prog" value="0" max="100" style="margin-top:10px;"></progress>
+    <div class="mono" id="upOut" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;align-items:flex-end;">
+      <div>
+        <h2>Fichiers (GET /api/files)</h2>
+        <div class="small">Download: GET /api/files/:id/download — Delete: DELETE /api/files/:id</div>
+      </div>
+      <button class="ghost" id="btnList">Lister</button>
+    </div>
+    <div id="tblWrap" style="margin-top:10px;"></div>
+  </div>
+</div>
+
+<script>
+  const $ = (id)=>document.getElementById(id);
+
+  function pretty(v){
+    try { return JSON.stringify(v, null, 2); } catch { return String(v); }
+  }
+
+  async function apiJson(path, opts={}){
+    const res = await fetch(path, { credentials:"include", ...opts });
+    const ct = res.headers.get("content-type") || "";
+    let bodyText = "";
+    let bodyJson = null;
+    if (ct.includes("application/json")) {
+      bodyJson = await res.json().catch(()=>null);
+    } else {
+      bodyText = await res.text().catch(()=> "");
+    }
+    if (!res.ok) {
+      const msg = bodyJson ? pretty(bodyJson) : (bodyText || res.statusText);
+      throw new Error(`HTTP ${res.status} ${res.statusText}\n${msg}`);
+    }
+    return bodyJson ?? bodyText;
+  }
+
+  async function refreshSession(){
+    try {
+      const me = await apiJson("/api/me");
+      $("sessTxt").textContent = me?.email ? "OK" : "??";
+      $("sessTxt").className = "ok";
+      return me;
+    } catch(e){
+      $("sessTxt").textContent = "OFF";
+      $("sessTxt").className = "warn";
+      return null;
+    }
+  }
+
+  function fmtBytes(n){
+    n = Number(n||0);
+    const u=["B","KB","MB","GB","TB"];
+    let i=0;
+    while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+    return `${n.toFixed(i?2:0)} ${u[i]}`;
+  }
+
+  function renderFiles(files){
+    if (!Array.isArray(files) || files.length===0) {
+      $("tblWrap").innerHTML = `<div class="small">Aucun fichier.</div>`;
+      return;
+    }
+    const rows = files.map(f=>`
+      <tr>
+        <td>${f.id}</td>
+        <td>${(f.filename||"").replaceAll("<","&lt;")}</td>
+        <td class="right">${fmtBytes(f.size_bytes)}</td>
+        <td>${(f.created_at||"")}</td>
+        <td class="right">
+          <a href="/api/files/${f.id}/download" target="_blank" rel="noreferrer">Download</a>
+          &nbsp;|&nbsp;
+          <button class="danger" data-del="${f.id}" style="padding:6px 10px;border-radius:10px;">Delete</button>
+        </td>
+      </tr>
+    `).join("");
+    $("tblWrap").innerHTML = `
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Nom</th><th class="right">Taille</th><th>Date</th><th class="right">Actions</th></tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+
+    document.querySelectorAll("button[data-del]").forEach(btn=>{
+      btn.addEventListener("click", async ()=>{
+        const id = btn.getAttribute("data-del");
+        if(!confirm(`Supprimer le fichier id=${id} ?`)) return;
+        try{
+          const r = await apiJson(`/api/files/${id}`, { method:"DELETE" });
+          $("boxOut").textContent = "DELETE OK\n" + pretty(r);
+          await listFiles();
+        }catch(e){
+          $("boxOut").textContent = String(e);
+        }
+      });
+    });
+  }
+
+  async function listFiles(){
+    try{
+      const r = await apiJson("/api/files");
+      // ton backend renvoie { status:"ok", files:[...] }
+      renderFiles(r.files || []);
+      $("boxOut").textContent = "LIST OK\n" + pretty(r);
+    }catch(e){
+      $("boxOut").textContent = String(e);
+      renderFiles([]);
+    }
+  }
+
+  async function doLogin(isRegister=false){
+    const email = $("email").value.trim();
+    const password = $("password").value;
+    try{
+      const r = await apiJson(isRegister?"/api/auth/register":"/api/auth/login", {
+        method:"POST",
+        headers:{ "content-type":"application/json" },
+        body: JSON.stringify({ email, password })
+      });
+      $("boxOut").textContent = (isRegister?"REGISTER OK\n":"LOGIN OK\n") + pretty(r);
+      await refreshSession();
+      await listFiles();
+    }catch(e){
+      $("boxOut").textContent = String(e);
+      await refreshSession();
+    }
+  }
+
+  async function doLogout(){
+    try{
+      const r = await apiJson("/api/auth/logout", { method:"POST" });
+      $("boxOut").textContent = "LOGOUT OK\n" + pretty(r);
+    }catch(e){
+      $("boxOut").textContent = String(e);
+    }
+    await refreshSession();
+    renderFiles([]);
+  }
+
+  // Upload avec vraie barre de progression (XHR)
+  function uploadFile(){
+    const f = $("file").files && $("file").files[0];
+    if(!f){ $("upOut").textContent="Choisis un fichier."; return; }
+
+    $("prog").value = 0;
+    $("upOut").textContent = "";
+
+    const form = new FormData();
+    form.append("file", f); // IMPORTANT: doit s'appeler "file"
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", "/api/files/upload", true); // IMPORTANT: /upload
+    xhr.withCredentials = true;
+
+    xhr.upload.onprogress = (e)=>{
+      if(e.lengthComputable){
+        const pct = Math.round((e.loaded/e.total)*100);
+        $("prog").value = pct;
+      }
+    };
+
+    xhr.onload = async ()=>{
+      $("prog").value = 100;
+      const ct = xhr.getResponseHeader("content-type") || "";
+      const body = xhr.responseText || "";
+      if(xhr.status >= 200 && xhr.status < 300){
+        $("upOut").textContent = "UPLOAD OK\n" + body;
+        await listFiles(); // refresh list
+      } else {
+        $("upOut").textContent = `UPLOAD FAIL HTTP ${xhr.status}\n` + body;
+      }
+      await refreshSession();
+    };
+
+    xhr.onerror = ()=>{
+      $("upOut").textContent = "UPLOAD FAIL (network)";
+    };
+
+    xhr.send(form);
+  }
+
+  // Wire buttons
+  $("btnLogin").addEventListener("click", ()=>doLogin(false));
+  $("btnRegister").addEventListener("click", ()=>doLogin(true));
+  $("btnLogout").addEventListener("click", doLogout);
+  $("btnMe").addEventListener("click", async ()=>{
+    try{ $("boxOut").textContent = pretty(await apiJson("/api/me")); }
+    catch(e){ $("boxOut").textContent = String(e); }
+    await refreshSession();
+  });
+  $("btnHealth").addEventListener("click", async ()=>{
+    try{ $("boxOut").textContent = pretty(await apiJson("/api/health")); }
+    catch(e){ $("boxOut").textContent = String(e); }
+  });
+  $("btnList").addEventListener("click", listFiles);
+  $("btnUpload").addEventListener("click", uploadFile);
+  $("btnRefresh").addEventListener("click", async ()=>{
+    await refreshSession();
+    await listFiles();
+  });
+
+  // Init
+  (async ()=>{
+    await refreshSession();
+    await listFiles();
+  })();
+</script>
+</body>
+</html>

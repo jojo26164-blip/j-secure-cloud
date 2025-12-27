@@ -1,16 +1,21 @@
 use axum::{
     extract::DefaultBodyLimit,
     http::{HeaderValue, Method},
+    middleware,
     routing::{delete, get, post},
     Router,
 };
 use tower_http::cors::CorsLayer;
+use tower_http::services::ServeDir;
 
+pub mod admin;
 pub mod auth;
 pub mod error;
 pub mod files;
 pub mod health;
+pub mod me;
 pub mod rate_limit;
+pub mod audit;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -19,7 +24,6 @@ pub struct AppState {
 
 fn cors_layer() -> CorsLayer {
     let origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
-
     if origins.trim().is_empty() {
         // DEV: open CORS
         return CorsLayer::new()
@@ -47,34 +51,44 @@ fn cors_layer() -> CorsLayer {
 
 pub fn api_router(state: AppState) -> Router {
     let cors = cors_layer();
+    let auth_layer = middleware::from_fn_with_state(state.clone(), auth::auth_middleware);
 
-    // ⚠️ Limite globale (large, pour ne pas casser les autres routes)
-    let body_limit = DefaultBodyLimit::max(64 * 1024 * 1024); // 64 MiB
-
-    // ✅ Limite upload contrôlée par env (B5)
-    let max_upload: usize = std::env::var("MAX_UPLOAD_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024); // 2 MiB par défaut
+    // Limite globale (hors upload) : 64 MiB
+    let body_limit = DefaultBodyLimit::max(64 * 1024 * 1024usize);
 
     let public = Router::new()
         .route("/health", get(health::health_handler))
         .route("/auth/login", post(auth::login_handler))
-        .route("/auth/register", post(auth::register_handler));
+        .route("/auth/register", post(auth::register_handler))
+        .route("/auth/logout", post(auth::logout_handler))
+        .layer(body_limit);
 
     let protected = Router::new()
         .route("/files", get(files::list_files_handler))
         .route("/files/:id/download", get(files::download_handler))
-        .route("/files/:id", delete(files::delete_handler));
+        .route("/files/:id", delete(files::delete_handler))
+        .route("/me", get(me::me_handler))
+        // admin
+        .route("/admin/stats", get(admin::stats_handler))
+        .route("/admin/users", get(admin::users_handler))
+        .route("/admin/users/:email/block", post(admin::block_user_handler))
+        .route(
+            "/admin/users/:email/unblock",
+            post(admin::unblock_user_handler),
+        )
+        .route("/admin/users/:email/quota", post(admin::set_quota_handler))
+        .route_layer(auth_layer.clone())
+        .layer(body_limit);
 
-    // ✅ Upload séparé + marge pour que Axum ne coupe pas avant ton 413
+    // Upload séparé
     let upload = Router::new()
         .route("/files/upload", post(files::upload_handler))
-        .layer(DefaultBodyLimit::max(max_upload + 1024 * 1024)); // +1MiB marge
+        .route_layer(auth_layer)
+        .layer(DefaultBodyLimit::max(6 * 1024 * 1024 * 1024usize)); // 6 GiB
 
     Router::new()
         .nest("/api", public.merge(protected).merge(upload))
+        .nest_service("/", ServeDir::new("static"))
         .layer(cors)
-        .layer(body_limit)
         .with_state(state)
 }
