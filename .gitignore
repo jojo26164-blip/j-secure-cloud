@@ -21,3 +21,7 @@ blob-report/
 
 # Rust
 target/
+
+admin.html
+dashboard_v1.html
+fichier.bin
