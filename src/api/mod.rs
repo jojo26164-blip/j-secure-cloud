@@ -61,13 +61,15 @@ pub fn api_router(state: AppState) -> Router {
         .route("/auth/login", post(auth::login_handler))
         .route("/auth/register", post(auth::register_handler))
         .route("/auth/logout", post(auth::logout_handler))
+        .route("/auth/me", get(auth::me_handler))
         .layer(body_limit);
 
     let protected = Router::new()
         .route("/files", get(files::list_files_handler))
         .route("/files/:id/download", get(files::download_handler))
-        .route("/files/:id", delete(files::delete_handler))
         .route("/me", get(me::me_handler))
+        .route("/files/:id", delete(files::delete_handler))
+
         // admin
         .route("/admin/stats", get(admin::stats_handler))
         .route("/admin/users", get(admin::users_handler))

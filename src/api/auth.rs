@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{
-        header::{AUTHORIZATION, COOKIE, SET_COOKIE},
+        header::{AUTHORIZATION, COOKIE, SET_COOKIE, CACHE_CONTROL},
         HeaderMap, StatusCode,
     },
     middleware::Next,
@@ -325,17 +325,26 @@ pub async fn login_handler(
     // JWT
     let token = create_jwt(&email_db)?;
 
-    // Cookie sécurisé (prod: Secure; dev: sans Secure si http)
-    // Mets COOKIE_SECURE=1 quand tu es en HTTPS
-    let is_prod = std::env::var("COOKIE_SECURE").unwrap_or_default() == "1";
-    let secure_flag = if is_prod { " Secure;" } else { "" };
 
-    let cookie = format!(
-        "jwt={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={};{}",
-        token,
-        60 * 60 * 24,
-        secure_flag
-    );
+// Cookie sécurisé : on met Secure automatiquement si on est derrière HTTPS
+// Cloudflare/Nginx doit envoyer X-Forwarded-Proto: https
+let proto = headers
+    .get("x-forwarded-proto")
+    .and_then(|v| v.to_str().ok())
+    .unwrap_or("");
+
+let secure_flag = if proto.eq_ignore_ascii_case("https") {
+    " Secure;"
+} else {
+    ""
+};
+
+let cookie = format!(
+    "jwt={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={};{}",
+    token,
+    60 * 60 * 24,
+    secure_flag
+);
 
     let mut resp = Json(AuthResponse {
         status: "ok".to_string(),
@@ -347,6 +356,8 @@ pub async fn login_handler(
 
     resp.headers_mut()
         .insert(SET_COOKIE, cookie.parse().unwrap());
+resp.headers_mut()
+    .insert(CACHE_CONTROL, "no-store".parse().unwrap());
 
     info!(email = %email_in, "login_ok");
     Ok(resp)
@@ -357,12 +368,13 @@ pub async fn login_handler(
 // ================================
 pub async fn logout_handler() -> impl IntoResponse {
     // Expire le cookie
-    let cookie = "jwt=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
+    // Secure pour être cohérent en prod (HTTPS)
+    let cookie = "jwt=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
     let mut resp = Json(serde_json::json!({"status":"ok","message":"logout"})).into_response();
     resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
+    resp.headers_mut().insert(CACHE_CONTROL, "no-store".parse().unwrap());
     resp
 }
-
 // ================================
 // Password verify
 // ================================
@@ -376,6 +388,21 @@ fn verify_password(hashed: &str, password: &str) -> bool {
         .is_ok()
 }
 
+#[derive(serde::Serialize)]
+pub struct MeResponse {
+    pub status: String,
+    pub email: String,
+}
+
+pub async fn me_handler(headers: HeaderMap) -> crate::api::error::ApiResult<Json<MeResponse>> {
+    let email = get_user_from_headers(&headers)
+        .map_err(|_| crate::api::error::ApiError::unauthorized_msg("Non authentifié"))?;
+
+    Ok(Json(MeResponse {
+        status: "ok".to_string(),
+        email,
+    }))
+}
 // ======================
 // Tests (optionnel)
 // ======================
