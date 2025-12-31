@@ -6,7 +6,7 @@ use axum::{
     body::Body,
     extract::{Request, State},
     http::{
-        header::{AUTHORIZATION, COOKIE, SET_COOKIE, CACHE_CONTROL},
+        header::{AUTHORIZATION, CACHE_CONTROL, COOKIE, SET_COOKIE},
         HeaderMap, StatusCode,
     },
     middleware::Next,
@@ -18,10 +18,12 @@ use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header as JwtHeader
 use once_cell::sync::Lazy;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::Row;
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 use tracing::{info, warn};
 
+use crate::api::audit::audit_log_best_effort;
 use crate::api::error::{db_err, ApiError, ApiResult};
 use crate::api::rate_limit::rate_limit_or_err;
 use crate::api::AppState;
@@ -131,7 +133,6 @@ pub async fn auth_middleware(
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let Some(row) = row else {
-        // user supprimé => token invalide
         return Err(StatusCode::UNAUTHORIZED);
     };
 
@@ -158,7 +159,7 @@ pub struct AuthResponse {
     pub status: String,
     pub message: String,
     pub email: Option<String>,
-    pub token: Option<String>, // on va mettre None (cookie only)
+    pub token: Option<String>, // cookie only
 }
 
 #[derive(Deserialize)]
@@ -238,11 +239,11 @@ pub async fn register_handler(
 // HANDLER : /auth/login  (COOKIE)
 // ================================
 pub async fn login_handler(
-    headers: HeaderMap,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<LoginPayload>,
-) -> ApiResult<impl IntoResponse> {
-    // Rate limit IP
+) -> ApiResult<Response> {
+    // Rate limit IP (déjà existant)
     rate_limit_or_err(&headers, "login", 10, Duration::from_secs(60))?;
 
     let email_in = payload.email.trim().to_lowercase();
@@ -252,28 +253,30 @@ pub async fn login_handler(
         return Err(ApiError::bad_request("email + mot de passe requis"));
     }
 
-    // Anti brute-force mémoire (par email)
-    {
-        let mut map = LOGIN_ATTEMPTS.lock().unwrap();
-        let entry = map.entry(email_in.clone()).or_insert(AttemptInfo {
-            failed: 0,
-            blocked_until: None,
-        });
+    let ip = "unknown"; // améliorable plus tard
 
-        if let Some(until) = entry.blocked_until {
-            if std::time::SystemTime::now() < until {
-                warn!(email = %email_in, "login_blocked_memory_rate_limit");
-                return Err(ApiError::rate_limited(
-                    "Trop de tentatives, réessaie dans quelques minutes.",
-                ));
-            } else {
-                entry.blocked_until = None;
-                entry.failed = 0;
-            }
+
+// Anti brute-force mémoire (par email) — IMPORTANT: lock NE DOIT PAS survivre à un await
+{
+    let mut map = LOGIN_ATTEMPTS.lock().unwrap();
+    let entry = map.entry(email_in.clone()).or_insert(AttemptInfo {
+        failed: 0,
+        blocked_until: None,
+    });
+
+    if let Some(until) = entry.blocked_until {
+        if std::time::SystemTime::now() < until {
+            warn!(email = %email_in, "login_blocked_memory_rate_limit");
+            return Err(ApiError::rate_limited(
+                "Trop de tentatives, réessaie dans quelques minutes.",
+            ));
+        } else {
+            entry.blocked_until = None;
+            entry.failed = 0;
         }
     }
 
-    // Récupération user (hash + blocked)
+}    // Récupération user (hash + blocked)
     let row = sqlx::query(
         r#"
         SELECT email, password_hash, COALESCE(is_blocked, 0) AS is_blocked
@@ -293,6 +296,18 @@ pub async fn login_handler(
 
     if is_blocked == 1 {
         warn!(email = %email_in, "login_blocked_user");
+
+        audit_log_best_effort(
+            &state.db,
+            Some(&email_in),
+            "login",
+            None,
+            ip,
+            "blocked",
+            json!({ "reason": "user_blocked_db" }),
+        )
+        .await;
+
         return Err(ApiError::forbidden("compte bloqué"));
     }
 
@@ -319,45 +334,57 @@ pub async fn login_handler(
 
     if !valid {
         warn!(email = %email_in, "login_failed_invalid_credentials");
+
+        audit_log_best_effort(
+            &state.db,
+            Some(&email_in),
+            "login",
+            None,
+            ip,
+            "fail",
+            json!({ "reason": "invalid_credentials" }),
+        )
+        .await;
+
         return Err(ApiError::unauthorized_msg("Email ou mot de passe invalide"));
     }
 
     // JWT
     let token = create_jwt(&email_db)?;
 
+    // Cookie sécurisé : Secure si on est derrière HTTPS
+    // Cloudflare/Nginx doit envoyer X-Forwarded-Proto: https
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-// Cookie sécurisé : on met Secure automatiquement si on est derrière HTTPS
-// Cloudflare/Nginx doit envoyer X-Forwarded-Proto: https
-let proto = headers
-    .get("x-forwarded-proto")
-    .and_then(|v| v.to_str().ok())
-    .unwrap_or("");
+    let secure_flag = if proto.eq_ignore_ascii_case("https") {
+        " Secure;"
+    } else {
+        ""
+    };
 
-let secure_flag = if proto.eq_ignore_ascii_case("https") {
-    " Secure;"
-} else {
-    ""
-};
-
-let cookie = format!(
-    "jwt={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={};{}",
-    token,
-    60 * 60 * 24,
-    secure_flag
-);
+    let cookie = format!(
+        "jwt={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={};{}",
+        token,
+        60 * 60 * 24,
+        secure_flag
+    );
 
     let mut resp = Json(AuthResponse {
         status: "ok".to_string(),
         message: "Connexion réussie".to_string(),
-        email: Some(email_db),
-        token: None, // IMPORTANT: on ne renvoie pas le JWT
+        email: Some(email_db.clone()),
+        token: None,
     })
     .into_response();
 
+    resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
     resp.headers_mut()
-        .insert(SET_COOKIE, cookie.parse().unwrap());
-resp.headers_mut()
-    .insert(CACHE_CONTROL, "no-store".parse().unwrap());
+        .insert(CACHE_CONTROL, "no-store".parse().unwrap());
+
+    audit_log_best_effort(&state.db, Some(&email_db), "login", None, ip, "ok", json!({})).await;
 
     info!(email = %email_in, "login_ok");
     Ok(resp)
@@ -366,15 +393,21 @@ resp.headers_mut()
 // ================================
 // HANDLER : /auth/logout (COOKIE)
 // ================================
-pub async fn logout_handler() -> impl IntoResponse {
-    // Expire le cookie
-    // Secure pour être cohérent en prod (HTTPS)
+pub async fn logout_handler(State(state): State<AppState>) -> ApiResult<Response> {
+    let ip = "unknown";
+
+    // Expire le cookie (cohérent prod HTTPS)
     let cookie = "jwt=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
     let mut resp = Json(serde_json::json!({"status":"ok","message":"logout"})).into_response();
     resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
-    resp.headers_mut().insert(CACHE_CONTROL, "no-store".parse().unwrap());
-    resp
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, "no-store".parse().unwrap());
+
+    audit_log_best_effort(&state.db, None, "logout", None, ip, "ok", json!({})).await;
+
+   Ok(resp)
 }
+
 // ================================
 // Password verify
 // ================================
@@ -394,15 +427,15 @@ pub struct MeResponse {
     pub email: String,
 }
 
-pub async fn me_handler(headers: HeaderMap) -> crate::api::error::ApiResult<Json<MeResponse>> {
+pub async fn me_handler(headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
     let email = get_user_from_headers(&headers)
-        .map_err(|_| crate::api::error::ApiError::unauthorized_msg("Non authentifié"))?;
-
+        .map_err(|_| ApiError::unauthorized_msg("Non authentifié"))?;
     Ok(Json(MeResponse {
         status: "ok".to_string(),
         email,
     }))
 }
+
 // ======================
 // Tests (optionnel)
 // ======================

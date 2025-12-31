@@ -35,7 +35,6 @@ http-body-util = "0.1"
 mime = "0.3"
 tempfile = "3.24.0"
 
-
 [lib]
 name = "jsecure_cloud"
 path = "src/lib.rs"
