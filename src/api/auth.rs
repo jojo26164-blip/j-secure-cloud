@@ -87,7 +87,10 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
     // 1) Authorization: Bearer ...
     if let Some(h) = headers.get(AUTHORIZATION).and_then(|v| v.to_str().ok()) {
         let h = h.trim();
-        if let Some(token) = h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")) {
+        if let Some(token) = h
+            .strip_prefix("Bearer ")
+            .or_else(|| h.strip_prefix("bearer "))
+        {
             return Some(token.trim().to_string());
         }
     }
@@ -97,7 +100,8 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 /// Utilisé par files/admin/me: extraction email depuis Authorization: Bearer OU cookie jwt
 pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
-    let token = bearer_token(headers).ok_or_else(|| "Auth manquante (Bearer ou cookie jwt)".to_string())?;
+    let token =
+        bearer_token(headers).ok_or_else(|| "Auth manquante (Bearer ou cookie jwt)".to_string())?;
     verify_jwt_email(&token)
 }
 
@@ -209,7 +213,9 @@ pub async fn register_handler(
 
     if exists.is_some() {
         warn!(email = %email, "register_conflict_email_exists");
-        return Err(ApiError::conflict("Un utilisateur avec cet email existe déjà"));
+        return Err(ApiError::conflict(
+            "Un utilisateur avec cet email existe déjà",
+        ));
     }
 
     let salt = SaltString::generate(&mut OsRng);
@@ -255,28 +261,26 @@ pub async fn login_handler(
 
     let ip = "unknown"; // améliorable plus tard
 
+    // Anti brute-force mémoire (par email) — IMPORTANT: lock NE DOIT PAS survivre à un await
+    {
+        let mut map = LOGIN_ATTEMPTS.lock().unwrap();
+        let entry = map.entry(email_in.clone()).or_insert(AttemptInfo {
+            failed: 0,
+            blocked_until: None,
+        });
 
-// Anti brute-force mémoire (par email) — IMPORTANT: lock NE DOIT PAS survivre à un await
-{
-    let mut map = LOGIN_ATTEMPTS.lock().unwrap();
-    let entry = map.entry(email_in.clone()).or_insert(AttemptInfo {
-        failed: 0,
-        blocked_until: None,
-    });
-
-    if let Some(until) = entry.blocked_until {
-        if std::time::SystemTime::now() < until {
-            warn!(email = %email_in, "login_blocked_memory_rate_limit");
-            return Err(ApiError::rate_limited(
-                "Trop de tentatives, réessaie dans quelques minutes.",
-            ));
-        } else {
-            entry.blocked_until = None;
-            entry.failed = 0;
+        if let Some(until) = entry.blocked_until {
+            if std::time::SystemTime::now() < until {
+                warn!(email = %email_in, "login_blocked_memory_rate_limit");
+                return Err(ApiError::rate_limited(
+                    "Trop de tentatives, réessaie dans quelques minutes.",
+                ));
+            } else {
+                entry.blocked_until = None;
+                entry.failed = 0;
+            }
         }
-    }
-
-}    // Récupération user (hash + blocked)
+    } // Récupération user (hash + blocked)
     let row = sqlx::query(
         r#"
         SELECT email, password_hash, COALESCE(is_blocked, 0) AS is_blocked
@@ -380,11 +384,21 @@ pub async fn login_handler(
     })
     .into_response();
 
-    resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
+    resp.headers_mut()
+        .insert(SET_COOKIE, cookie.parse().unwrap());
     resp.headers_mut()
         .insert(CACHE_CONTROL, "no-store".parse().unwrap());
 
-    audit_log_best_effort(&state.db, Some(&email_db), "login", None, ip, "ok", json!({})).await;
+    audit_log_best_effort(
+        &state.db,
+        Some(&email_db),
+        "login",
+        None,
+        ip,
+        "ok",
+        json!({}),
+    )
+    .await;
 
     info!(email = %email_in, "login_ok");
     Ok(resp)
@@ -399,13 +413,14 @@ pub async fn logout_handler(State(state): State<AppState>) -> ApiResult<Response
     // Expire le cookie (cohérent prod HTTPS)
     let cookie = "jwt=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
     let mut resp = Json(serde_json::json!({"status":"ok","message":"logout"})).into_response();
-    resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
+    resp.headers_mut()
+        .insert(SET_COOKIE, cookie.parse().unwrap());
     resp.headers_mut()
         .insert(CACHE_CONTROL, "no-store".parse().unwrap());
 
     audit_log_best_effort(&state.db, None, "logout", None, ip, "ok", json!({})).await;
 
-   Ok(resp)
+    Ok(resp)
 }
 
 // ================================

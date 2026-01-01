@@ -4,8 +4,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use sqlx::SqlitePool;
-use tower::ServiceExt; // oneshot
 use tempfile::tempdir;
+use tower::ServiceExt; // oneshot
 
 use jsecure_cloud::api::{api_router, AppState};
 
@@ -166,7 +166,13 @@ async fn download(app: &axum::Router, jwt: &str, id: i64) -> (StatusCode, Vec<u8
 
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
+    let body = resp
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
     (status, body)
 }
 
@@ -210,5 +216,5 @@ async fn download_not_owner_is_404() {
     let id = list_first_id(&app, &jwt_a).await;
 
     let (st, _bytes) = download(&app, &jwt_b, id).await;
-assert_eq!(st, StatusCode::FORBIDDEN);
+    assert_eq!(st, StatusCode::FORBIDDEN);
 }

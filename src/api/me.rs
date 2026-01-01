@@ -84,10 +84,9 @@ pub async fn me_handler(
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(1024 * 1024 * 1024); // 1 GiB défaut
 
-
-let quota_db: Option<i64> = row_user.try_get("quota_bytes").ok();
-let quota_db = quota_db.filter(|v| *v > 0);
-let max_bytes = quota_db.unwrap_or(fallback);
+    let quota_db: Option<i64> = row_user.try_get("quota_bytes").ok();
+    let quota_db = quota_db.filter(|v| *v > 0);
+    let max_bytes = quota_db.unwrap_or(fallback);
 
     let used_percent = if max_bytes > 0 {
         (used_bytes as f64 / max_bytes as f64) * 100.0

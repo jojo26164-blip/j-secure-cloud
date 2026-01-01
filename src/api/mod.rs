@@ -9,13 +9,13 @@ use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 
 pub mod admin;
+pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod files;
 pub mod health;
 pub mod me;
 pub mod rate_limit;
-pub mod audit;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -23,32 +23,21 @@ pub struct AppState {
 }
 
 fn cors_layer() -> CorsLayer {
-    let origins = std::env::var("CORS_ORIGINS").unwrap_or_default();
-    if origins.trim().is_empty() {
-        // DEV: open CORS
-        return CorsLayer::new()
-            .allow_origin(tower_http::cors::Any)
-            .allow_methods([Method::GET, Method::POST, Method::DELETE])
-            .allow_headers(tower_http::cors::Any);
-    }
-
-    // PROD: strict allowlist
-    let allowed: Vec<HeaderValue> = origins
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| s.parse::<HeaderValue>().ok())
-        .collect();
-
     CorsLayer::new()
-        .allow_origin(allowed)
-        .allow_methods([Method::GET, Method::POST, Method::DELETE])
+        // cookies => pas de "*"
+        .allow_origin([
+            HeaderValue::from_static("https://jsecure-cloud.com"),
+            // option dev
+            HeaderValue::from_static("http://localhost:5173"),
+        ])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        // pas "Any" (pas "*") car allow_credentials(true)
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::header::AUTHORIZATION,
         ])
+        .allow_credentials(true)
 }
-
 pub fn api_router(state: AppState) -> Router {
     let cors = cors_layer();
     let auth_layer = middleware::from_fn_with_state(state.clone(), auth::auth_middleware);
@@ -69,7 +58,6 @@ pub fn api_router(state: AppState) -> Router {
         .route("/files/:id/download", get(files::download_handler))
         .route("/me", get(me::me_handler))
         .route("/files/:id", delete(files::delete_handler))
-
         // admin
         .route("/admin/stats", get(admin::stats_handler))
         .route("/admin/users", get(admin::users_handler))

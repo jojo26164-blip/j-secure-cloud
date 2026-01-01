@@ -1,6 +1,6 @@
 use serde_json::Value;
 use sqlx::SqlitePool;
-use tracing::{warn};
+use tracing::warn;
 
 use crate::api::error::ApiError;
 
@@ -11,7 +11,7 @@ pub async fn audit_log_best_effort(
     action: &str,
     target: Option<&str>,
     ip: &str,
-    status: &str,          // "ok" | "fail"
+    status: &str, // "ok" | "fail"
     meta: Value,
 ) {
     let actor = actor_email.map(|s| s.trim().to_lowercase());
@@ -21,7 +21,7 @@ pub async fn audit_log_best_effort(
         r#"
         INSERT INTO audit_logs (actor_email, action, target, ip, status, meta_json)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        "#
+        "#,
     )
     .bind(actor)
     .bind(action)
@@ -53,7 +53,7 @@ pub async fn audit_log_strict(
         r#"
         INSERT INTO audit_logs (actor_email, action, target, ip, status, meta_json)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        "#
+        "#,
     )
     .bind(actor)
     .bind(action)

@@ -87,10 +87,7 @@ async fn register_and_login_cookie(app: &axum::Router, email: &str) -> String {
         .expect("missing Set-Cookie from login");
 
     // ex: "jwt=XYZ; HttpOnly; SameSite=Lax; Path=/; Max-Age=..."
-    let jwt_pair = set_cookie
-        .split(';')
-        .next()
-        .expect("bad Set-Cookie format");
+    let jwt_pair = set_cookie.split(';').next().expect("bad Set-Cookie format");
 
     jwt_pair.to_string()
 }
@@ -120,7 +117,10 @@ async fn upload_multipart(
     let mut req = Request::builder()
         .method("POST")
         .uri("/api/files/upload")
-        .header("content-type", format!("multipart/form-data; boundary={}", boundary));
+        .header(
+            "content-type",
+            format!("multipart/form-data; boundary={}", boundary),
+        );
 
     if let Some(c) = cookie_jwt {
         req = req.header("cookie", c);

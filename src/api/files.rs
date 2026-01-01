@@ -252,8 +252,8 @@ async fn scan_file_with_clamav(path: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    let sock = std::env::var("CLAMD_SOCKET")
-        .unwrap_or_else(|_| "/run/clamav/clamd.ctl".to_string());
+    let sock =
+        std::env::var("CLAMD_SOCKET").unwrap_or_else(|_| "/run/clamav/clamd.ctl".to_string());
 
     let mut stream = UnixStream::connect(&sock)
         .await
@@ -385,7 +385,16 @@ pub async fn list_files_handler(
     let owner_email = match get_user_from_headers(&headers) {
         Ok(e) => e.trim().to_lowercase(),
         Err(msg) => {
-            audit_log_best_effort(&state.db, None, "list_files", None, &ip, "fail", audit_meta_err(&msg)).await;
+            audit_log_best_effort(
+                &state.db,
+                None,
+                "list_files",
+                None,
+                &ip,
+                "fail",
+                audit_meta_err(&msg),
+            )
+            .await;
             return Err(ApiError::unauthorized());
         }
     };
@@ -428,12 +437,38 @@ pub async fn upload_handler(
 ) -> ApiResult<Json<UploadResponse>> {
     let ip = client_ip(&headers);
 
-    rate_limit_or_err(&headers, "upload", 30, Duration::from_secs(60))?;
+    // Rate limit
+    if let Err(e) = rate_limit_or_err(&headers, "upload", 30, Duration::from_secs(60)) {
+        audit_log_best_effort(
+            &state.db,
+            None,
+            "upload",
+            None,
+            &ip,
+            "denied",
+            serde_json::json!({
+                "reason": "rate_limited",
+                "where": "upload",
+            }),
+        )
+        .await;
+        return Err(e);
+    }
 
+    // Auth
     let owner_email = match get_user_from_headers(&headers) {
         Ok(email) => email.trim().to_lowercase(),
         Err(msg) => {
-            audit_log_best_effort(&state.db, None, "upload", None, &ip, "fail", audit_meta_err(&msg)).await;
+            audit_log_best_effort(
+                &state.db,
+                None,
+                "upload",
+                None,
+                &ip,
+                "fail",
+                audit_meta_err(&msg),
+            )
+            .await;
             return Err(ApiError::unauthorized());
         }
     };
@@ -446,6 +481,21 @@ pub async fn upload_handler(
     if let Some(cl) = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()) {
         if let Ok(size) = cl.parse::<u64>() {
             if size > max_upload {
+                audit_log_best_effort(
+                    &state.db,
+                    Some(&owner_email),
+                    "upload",
+                    None,
+                    &ip,
+                    "denied",
+                    serde_json::json!({
+                        "reason": "payload_too_large",
+                        "content_length": size,
+                        "max_upload": max_upload,
+                        "phase": "early_content_length",
+                    }),
+                )
+                .await;
                 return Err(ApiError::payload_too_large("fichier trop volumineux"));
             }
         }
@@ -457,15 +507,33 @@ pub async fn upload_handler(
 
     // Prepare dirs
     let up_dir = uploads_dir();
-    tokio::fs::create_dir_all(&up_dir).await.map_err(|_| ApiError::internal())?;
+    tokio::fs::create_dir_all(&up_dir)
+        .await
+        .map_err(|_| ApiError::internal())?;
 
     let t_dir = tmp_dir();
-    tokio::fs::create_dir_all(&t_dir).await.map_err(|_| ApiError::internal())?;
+    tokio::fs::create_dir_all(&t_dir)
+        .await
+        .map_err(|_| ApiError::internal())?;
 
     // Disk free
     let vfs = statvfs(&up_dir).map_err(|_| ApiError::internal())?;
     let free_bytes = (vfs.blocks_available() as u64) * (vfs.block_size() as u64);
     if free_bytes < min_free_bytes() {
+        audit_log_best_effort(
+            &state.db,
+            Some(&owner_email),
+            "upload",
+            None,
+            &ip,
+            "denied",
+            serde_json::json!({
+                "reason": "insufficient_storage",
+                "free_bytes": free_bytes,
+                "min_free_bytes": min_free_bytes(),
+            }),
+        )
+        .await;
         return Err(ApiError::insufficient_storage("espace disque insuffisant"));
     }
 
@@ -475,11 +543,28 @@ pub async fn upload_handler(
     let mut final_name: Option<String> = None;
     let mut total_written: u64 = 0;
 
-    while let Some(field) = multipart.next_field().await.map_err(|_| ApiError::bad_request("Erreur lecture multipart"))? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| ApiError::bad_request("Erreur lecture multipart"))?
+    {
         if field.name() == Some("file") {
             let fname = field.file_name().unwrap_or("upload.bin").to_string();
 
             if is_forbidden_extension(&fname) {
+                audit_log_best_effort(
+                    &state.db,
+                    Some(&owner_email),
+                    "upload",
+                    Some(&fname),
+                    &ip,
+                    "denied",
+                    serde_json::json!({
+                        "reason": "forbidden_extension",
+                        "filename": fname,
+                    }),
+                )
+                .await;
                 return Err(ApiError::file_refused());
             }
 
@@ -491,7 +576,9 @@ pub async fn upload_handler(
             final_name = Some(unique.clone());
             temp_path = Some(tmp.clone());
 
-            let mut out = tokio::fs::File::create(&tmp).await.map_err(|_| ApiError::internal())?;
+            let mut out = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|_| ApiError::internal())?;
 
             let mut stream = field.into_stream();
             while let Some(chunk_res) = stream.next().await {
@@ -500,27 +587,90 @@ pub async fn upload_handler(
 
                 if total_written > max_upload {
                     let _ = tokio::fs::remove_file(&tmp).await;
+                    audit_log_best_effort(
+                        &state.db,
+                        Some(&owner_email),
+                        "upload",
+                        original_name.as_deref(),
+                        &ip,
+                        "denied",
+                        serde_json::json!({
+                            "reason": "payload_too_large",
+                            "written": total_written,
+                            "max_upload": max_upload
+                        }),
+                    )
+                    .await;
                     return Err(ApiError::payload_too_large("fichier trop volumineux"));
                 }
 
                 let projected = used_bytes.saturating_add(total_written as i64);
                 if projected > max_user_storage {
                     let _ = tokio::fs::remove_file(&tmp).await;
+                    audit_log_best_effort(
+                        &state.db,
+                        Some(&owner_email),
+                        "upload",
+                        original_name.as_deref(),
+                        &ip,
+                        "denied",
+                        serde_json::json!({
+                            "reason": "quota_exceeded",
+                            "used_bytes": used_bytes,
+                            "written": total_written,
+                            "projected_bytes": projected,
+                            "quota_bytes": max_user_storage,
+                        }),
+                    )
+                    .await;
                     return Err(ApiError::quota_exceeded("quota de stockage dépassé"));
                 }
 
-                out.write_all(&chunk).await.map_err(|_| ApiError::internal())?;
+                out.write_all(&chunk)
+                    .await
+                    .map_err(|_| ApiError::internal())?;
             }
 
             out.flush().await.map_err(|_| ApiError::internal())?;
             drop(out);
 
-            // Optional clamav (tu peux ajuster les skip)
+            // Optional clamav
             if let Err(reason) = scan_file_with_clamav(&tmp).await {
                 let _ = tokio::fs::remove_file(&tmp).await;
+
                 if reason.contains("FOUND") {
+                    audit_log_best_effort(
+                        &state.db,
+                        Some(&owner_email),
+                        "upload",
+                        final_name.as_deref(),
+                        &ip,
+                        "denied",
+                        serde_json::json!({
+                            "reason": "virus_detected",
+                            "engine": "clamav",
+                            "clamav_resp": reason,
+                        }),
+                    )
+                    .await;
                     return Err(ApiError::virus_detected());
                 }
+
+                audit_log_best_effort(
+                    &state.db,
+                    Some(&owner_email),
+                    "upload",
+                    final_name.as_deref(),
+                    &ip,
+                    "error",
+                    serde_json::json!({
+                        "reason": "clamav_error",
+                        "engine": "clamav",
+                        "clamav_resp": reason,
+                    }),
+                )
+                .await;
+
                 return Err(ApiError::internal_msg(format!("ClamAV error: {reason}")));
             }
 
@@ -531,9 +681,11 @@ pub async fn upload_handler(
     let orig = original_name.ok_or_else(|| ApiError::bad_request("Champ 'file' manquant"))?;
     let tmp = temp_path.ok_or_else(ApiError::internal)?;
     let stored = final_name.ok_or_else(ApiError::internal)?;
-    let final_path = uploads_dir().join(&stored);
 
-    tokio::fs::rename(&tmp, &final_path).await.map_err(|_| ApiError::internal())?;
+    let final_path = uploads_dir().join(&stored);
+    tokio::fs::rename(&tmp, &final_path)
+        .await
+        .map_err(|_| ApiError::internal())?;
 
     let size_bytes = total_written as i64;
 
@@ -549,8 +701,36 @@ pub async fn upload_handler(
     {
         error!(error=%e, "upload_db_insert_failed");
         let _ = tokio::fs::remove_file(&final_path).await;
+        audit_log_best_effort(
+            &state.db,
+            Some(&owner_email),
+            "upload",
+            Some(&stored),
+            &ip,
+            "fail",
+            serde_json::json!({
+                "reason": "db_insert_failed",
+                "stored": stored,
+            }),
+        )
+        .await;
         return Err(ApiError::internal());
     }
+
+    audit_log_best_effort(
+        &state.db,
+        Some(&owner_email),
+        "upload",
+        Some(&stored),
+        &ip,
+        "ok",
+        serde_json::json!({
+            "original": orig,
+            "stored": stored,
+            "size_bytes": size_bytes,
+        }),
+    )
+    .await;
 
     info!(owner=%owner_email, original=%orig, stored=%stored, size=%size_bytes, "upload_ok");
 
@@ -561,6 +741,7 @@ pub async fn upload_handler(
         size_bytes,
     }))
 }
+
 
 //===========================================================//
 // GET /api/files/:id/download (streaming + Range + audit)
@@ -576,7 +757,16 @@ pub async fn download_handler(
     let owner_email = match get_user_from_headers(&headers) {
         Ok(e) => e.trim().to_lowercase(),
         Err(msg) => {
-            audit_log_best_effort(&state.db, None, "download", None, &ip, "fail", audit_meta_err(&msg)).await;
+            audit_log_best_effort(
+                &state.db,
+                None,
+                "download",
+                None,
+                &ip,
+                "fail",
+                audit_meta_err(&msg),
+            )
+            .await;
             return Err(ApiError::unauthorized());
         }
     };
@@ -591,7 +781,8 @@ pub async fn download_handler(
             &ip,
             "fail",
             serde_json::json!({ "reason": "blocked" }),
-        ).await;
+        )
+        .await;
         return Err(e);
     }
 
@@ -618,7 +809,8 @@ pub async fn download_handler(
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "db_not_found" }),
-            ).await;
+            )
+            .await;
             return Err(ApiError::not_found("file introuvable"));
         }
         Err(_) => {
@@ -630,7 +822,8 @@ pub async fn download_handler(
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "db_error" }),
-            ).await;
+            )
+            .await;
             return Err(ApiError::internal());
         }
     };
@@ -648,7 +841,8 @@ pub async fn download_handler(
             &ip,
             "fail",
             serde_json::json!({ "reason": "forbidden_cross_user" }),
-        ).await;
+        )
+        .await;
         return Err(ApiError::forbidden("cross-user access"));
     }
 
@@ -665,7 +859,8 @@ pub async fn download_handler(
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "disk_missing", "stored": stored_name }),
-            ).await;
+            )
+            .await;
             return Err(ApiError::not_found("fichier manquant sur disque"));
         }
     };
@@ -688,7 +883,8 @@ pub async fn download_handler(
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "open_failed", "stored": stored_name }),
-            ).await;
+            )
+            .await;
             return Err(ApiError::not_found("fichier non lisible"));
         }
     };
@@ -712,11 +908,18 @@ pub async fn download_handler(
             *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
 
             let cr = format!("bytes {}-{}/{}", start, end, file_size);
-            resp.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-            resp.headers_mut().insert(CONTENT_RANGE, HeaderValue::from_str(&cr).unwrap());
-            resp.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_str(&len.to_string()).unwrap());
-            resp.headers_mut().insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
-            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            resp.headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            resp.headers_mut()
+                .insert(CONTENT_RANGE, HeaderValue::from_str(&cr).unwrap());
+            resp.headers_mut().insert(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(&len.to_string()).unwrap(),
+            );
+            resp.headers_mut()
+                .insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
 
             audit_log_best_effort(
                 &state.db,
@@ -734,19 +937,23 @@ pub async fn download_handler(
                     "end": end,
                     "status": 206
                 }),
-            ).await;
+            )
+            .await;
 
             return Ok(resp);
         } else {
             let mut resp = Response::new(axum::body::Body::empty());
             *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
-            resp.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            resp.headers_mut()
+                .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             resp.headers_mut().insert(
                 CONTENT_RANGE,
                 HeaderValue::from_str(&format!("bytes */{}", file_size)).unwrap(),
             );
-            resp.headers_mut().insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
-            resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+            resp.headers_mut()
+                .insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
+            resp.headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
 
             audit_log_best_effort(
                 &state.db,
@@ -761,7 +968,8 @@ pub async fn download_handler(
                     "file_size": file_size,
                     "status": 416
                 }),
-            ).await;
+            )
+            .await;
 
             return Ok(resp);
         }
@@ -774,10 +982,16 @@ pub async fn download_handler(
     let mut resp = Response::new(body);
     *resp.status_mut() = StatusCode::OK;
 
-    resp.headers_mut().insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    resp.headers_mut().insert(CONTENT_LENGTH, HeaderValue::from_str(&file_size.to_string()).unwrap());
-    resp.headers_mut().insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
-    resp.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(ct));
+    resp.headers_mut()
+        .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    resp.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&file_size.to_string()).unwrap(),
+    );
+    resp.headers_mut()
+        .insert(CONTENT_DISPOSITION, HeaderValue::from_str(&cd).unwrap());
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(ct));
 
     audit_log_best_effort(
         &state.db,
@@ -792,12 +1006,11 @@ pub async fn download_handler(
             "file_size": file_size,
             "status": 200
         }),
-    ).await;
+    )
+    .await;
 
     Ok(resp)
 }
-
-
 
 // DELETE /api/files/:id
 pub async fn delete_handler(
@@ -810,7 +1023,16 @@ pub async fn delete_handler(
     let owner_email = match get_user_from_headers(&headers) {
         Ok(e) => e.trim().to_lowercase(),
         Err(msg) => {
-            audit_log_best_effort(&state.db, None, "delete", None, &ip, "fail", audit_meta_err(&msg)).await;
+            audit_log_best_effort(
+                &state.db,
+                None,
+                "delete",
+                None,
+                &ip,
+                "fail",
+                audit_meta_err(&msg),
+            )
+            .await;
             return Err(ApiError::unauthorized());
         }
     };

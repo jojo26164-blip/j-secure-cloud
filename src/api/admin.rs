@@ -16,7 +16,10 @@ use crate::api::AppState;
 // Helpers
 // -----------------------------
 fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+    {
         return v.trim().to_string();
     }
     if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
@@ -47,7 +50,7 @@ async fn is_admin_db(state: &AppState, email: &str) -> bool {
         FROM users
         WHERE lower(email)=lower(?1)
         LIMIT 1
-        "#
+        "#,
     )
     .bind(email)
     .fetch_optional(&state.db)
@@ -72,7 +75,7 @@ async fn audit_admin(
         r#"
         INSERT INTO admin_audit (admin_email, action, target_email, ip, meta_json)
         VALUES (?1, ?2, ?3, ?4, ?5)
-        "#
+        "#,
     )
     .bind(admin_email)
     .bind(action)
@@ -85,8 +88,7 @@ async fn audit_admin(
 
 // Vérif admin standard (DB d’abord, sinon ENV)
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
-    let email = get_user_from_headers(headers)
-        .map_err(|_| ApiError::unauthorized())?;
+    let email = get_user_from_headers(headers).map_err(|_| ApiError::unauthorized())?;
 
     // Logs utiles
     info!("ADMIN CHECK email={}", email);
@@ -113,8 +115,10 @@ pub async fn stats_handler(
     State(state): State<AppState>,
 ) -> ApiResult<Json<AdminStatsResponse>> {
     let ip = client_ip(&headers);
-    let admin_email = require_admin(&state, &headers).await
-        .map_err(|e| { warn!(%ip, "admin_stats_forbidden"); e })?;
+    let admin_email = require_admin(&state, &headers).await.map_err(|e| {
+        warn!(%ip, "admin_stats_forbidden");
+        e
+    })?;
 
     let users_count: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM users")
         .fetch_one(&state.db)
@@ -140,7 +144,11 @@ pub async fn stats_handler(
             })?;
 
     info!(%ip, owner=%admin_email, users_count, files_count, total_bytes, "admin_stats_ok");
-    Ok(Json(AdminStatsResponse { users_count, files_count, total_bytes }))
+    Ok(Json(AdminStatsResponse {
+        users_count,
+        files_count,
+        total_bytes,
+    }))
 }
 
 // -----------------------------
@@ -160,8 +168,10 @@ pub async fn users_handler(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Vec<AdminUserRow>>> {
     let ip = client_ip(&headers);
-    let admin_email = require_admin(&state, &headers).await
-        .map_err(|e| { warn!(%ip, "admin_users_forbidden"); e })?;
+    let admin_email = require_admin(&state, &headers).await.map_err(|e| {
+        warn!(%ip, "admin_users_forbidden");
+        e
+    })?;
 
     let rows = sqlx::query(
         r#"
@@ -174,7 +184,7 @@ pub async fn users_handler(
         FROM users
         ORDER BY id DESC
         LIMIT 200
-        "#
+        "#,
     )
     .fetch_all(&state.db)
     .await
@@ -228,7 +238,7 @@ pub async fn block_user_handler(
         UPDATE users
         SET is_blocked = 1
         WHERE lower(email) = ?1
-        "#
+        "#,
     )
     .bind(&target)
     .execute(&state.db)
@@ -242,8 +252,19 @@ pub async fn block_user_handler(
         return Err(ApiError::not_found("user introuvable"));
     }
 
-    audit_admin(&state, &admin_email, "block_user", Some(&target), &ip, json!({})).await;
-    Ok(Json(AdminOkResponse { status: "ok", message: format!("user bloqué: {target}") }))
+    audit_admin(
+        &state,
+        &admin_email,
+        "block_user",
+        Some(&target),
+        &ip,
+        json!({}),
+    )
+    .await;
+    Ok(Json(AdminOkResponse {
+        status: "ok",
+        message: format!("user bloqué: {target}"),
+    }))
 }
 
 // -----------------------------
@@ -267,7 +288,7 @@ pub async fn unblock_user_handler(
         UPDATE users
         SET is_blocked = 0
         WHERE lower(email) = ?1
-        "#
+        "#,
     )
     .bind(&target)
     .execute(&state.db)
@@ -281,8 +302,19 @@ pub async fn unblock_user_handler(
         return Err(ApiError::not_found("user introuvable"));
     }
 
-    audit_admin(&state, &admin_email, "unblock_user", Some(&target), &ip, json!({})).await;
-    Ok(Json(AdminOkResponse { status: "ok", message: format!("user débloqué: {target}") }))
+    audit_admin(
+        &state,
+        &admin_email,
+        "unblock_user",
+        Some(&target),
+        &ip,
+        json!({}),
+    )
+    .await;
+    Ok(Json(AdminOkResponse {
+        status: "ok",
+        message: format!("user débloqué: {target}"),
+    }))
 }
 
 // -----------------------------
@@ -317,7 +349,7 @@ pub async fn set_quota_handler(
         UPDATE users
         SET quota_bytes = ?1
         WHERE lower(email) = ?2
-        "#
+        "#,
     )
     .bind(payload.quota_bytes)
     .bind(&target)
