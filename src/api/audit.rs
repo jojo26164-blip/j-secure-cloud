@@ -19,7 +19,7 @@ pub async fn audit_log_best_effort(
 
     let q = sqlx::query(
         r#"
-        INSERT INTO audit_logs (actor_email, action, target, ip, status, meta_json)
+        INSERT INTO audit_logs (actor_email, action, target, ip, status, details)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
     )
@@ -51,7 +51,7 @@ pub async fn audit_log_strict(
 
     sqlx::query(
         r#"
-        INSERT INTO audit_logs (actor_email, action, target, ip, status, meta_json)
+        INSERT INTO audit_logs (actor_email, action, target, ip, status, details)
         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
     )

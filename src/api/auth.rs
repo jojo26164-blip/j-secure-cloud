@@ -49,6 +49,7 @@ fn create_jwt(email: &str) -> ApiResult<String> {
         sub: email.to_string(),
         exp,
     };
+
     encode(
         &JwtHeader::default(),
         &claims,
@@ -100,9 +101,71 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
 
 /// Utilisé par files/admin/me: extraction email depuis Authorization: Bearer OU cookie jwt
 pub fn get_user_from_headers(headers: &HeaderMap) -> Result<String, String> {
-    let token =
-        bearer_token(headers).ok_or_else(|| "Auth manquante (Bearer ou cookie jwt)".to_string())?;
+    let token = bearer_token(headers)
+        .ok_or_else(|| "Auth manquante (Bearer ou cookie jwt)".to_string())?;
     verify_jwt_email(&token)
+}
+
+fn cookie_domain_opt() -> Option<String> {
+    let d = std::env::var("COOKIE_DOMAIN").ok()?.trim().to_string();
+    if d.is_empty() { None } else { Some(d) }
+}
+
+/// Par défaut: Secure ON (prod). Tu peux désactiver en dev via COOKIE_SECURE=0.
+fn cookie_secure_enabled() -> bool {
+    match std::env::var("COOKIE_SECURE").ok().as_deref() {
+        Some("0") | Some("false") | Some("no") => false,
+        _ => true,
+    }
+}
+
+fn build_jwt_cookie(token: &str, max_age_secs: i64) -> String {
+    // Domain commun aux sous-domaines (jsecure-cloud.com + upload.jsecure-cloud.com)
+    let domain = std::env::var("COOKIE_DOMAIN")
+        .unwrap_or_else(|_| ".jsecure-cloud.com".to_string())
+        .trim()
+        .to_string();
+
+    // IMPORTANT pour cross-site fetch avec credentials:
+    // SameSite=None + Secure
+    format!(
+        "jwt={}; Path=/; HttpOnly; SameSite=None; Secure; Max-Age={}; Domain={}",
+        token, max_age_secs, domain
+    )
+}
+
+
+fn build_delete_cookie() -> String {
+    // IMPORTANT: pour supprimer un cookie avec Domain, il faut renvoyer le même Domain.
+    let mut s = "jwt=; Path=/; HttpOnly; SameSite=None; Max-Age=0".to_string();
+    if let Some(domain) = cookie_domain_opt() {
+        s.push_str(&format!("; Domain={}", domain));
+    }
+    if cookie_secure_enabled() {
+        s.push_str("; Secure");
+    }
+    s
+}
+
+// =====================
+// IP helper
+// =====================
+fn client_ip(headers: &HeaderMap) -> String {
+    if let Some(v) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+    {
+        return v.trim().to_string();
+    }
+    if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
+        return v
+            .split(',')
+            .next()
+            .unwrap_or("unknown")
+            .trim()
+            .to_string();
+    }
+    "unknown".to_string()
 }
 
 // ================================
@@ -139,7 +202,6 @@ pub async fn auth_middleware(
     let Some(row) = row else {
         return Err(StatusCode::UNAUTHORIZED);
     };
-
     let is_blocked: i64 = row.try_get("is_blocked").unwrap_or(0);
     if is_blocked == 1 {
         return Err(StatusCode::FORBIDDEN);
@@ -213,9 +275,7 @@ pub async fn register_handler(
 
     if exists.is_some() {
         warn!(email = %email, "register_conflict_email_exists");
-        return Err(ApiError::conflict(
-            "Un utilisateur avec cet email existe déjà",
-        ));
+        return Err(ApiError::conflict("Un utilisateur avec cet email existe déjà"));
     }
 
     let salt = SaltString::generate(&mut OsRng);
@@ -232,7 +292,6 @@ pub async fn register_handler(
         .map_err(|e| db_err("insert user", e))?;
 
     info!(email = %email, "register_ok");
-
     Ok(Json(AuthResponse {
         status: "ok".to_string(),
         message: "Utilisateur créé".to_string(),
@@ -242,14 +301,13 @@ pub async fn register_handler(
 }
 
 // ================================
-// HANDLER : /auth/login  (COOKIE)
+// HANDLER : /auth/login (COOKIE)
 // ================================
 pub async fn login_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<LoginPayload>,
 ) -> ApiResult<Response> {
-    // Rate limit IP (déjà existant)
     rate_limit_or_err(&headers, "login", 10, Duration::from_secs(60))?;
 
     let email_in = payload.email.trim().to_lowercase();
@@ -259,7 +317,7 @@ pub async fn login_handler(
         return Err(ApiError::bad_request("email + mot de passe requis"));
     }
 
-    let ip = "unknown"; // améliorable plus tard
+    let ip = client_ip(&headers);
 
     // Anti brute-force mémoire (par email) — IMPORTANT: lock NE DOIT PAS survivre à un await
     {
@@ -268,7 +326,6 @@ pub async fn login_handler(
             failed: 0,
             blocked_until: None,
         });
-
         if let Some(until) = entry.blocked_until {
             if std::time::SystemTime::now() < until {
                 warn!(email = %email_in, "login_blocked_memory_rate_limit");
@@ -280,7 +337,9 @@ pub async fn login_handler(
                 entry.failed = 0;
             }
         }
-    } // Récupération user (hash + blocked)
+    }
+
+    // Récupération user (hash + blocked)
     let row = sqlx::query(
         r#"
         SELECT email, password_hash, COALESCE(is_blocked, 0) AS is_blocked
@@ -300,18 +359,16 @@ pub async fn login_handler(
 
     if is_blocked == 1 {
         warn!(email = %email_in, "login_blocked_user");
-
         audit_log_best_effort(
             &state.db,
             Some(&email_in),
             "login",
             None,
-            ip,
+            &ip,
             "blocked",
             json!({ "reason": "user_blocked_db" }),
         )
         .await;
-
         return Err(ApiError::forbidden("compte bloqué"));
     }
 
@@ -324,7 +381,6 @@ pub async fn login_handler(
             failed: 0,
             blocked_until: None,
         });
-
         if valid {
             entry.failed = 0;
             entry.blocked_until = None;
@@ -338,43 +394,23 @@ pub async fn login_handler(
 
     if !valid {
         warn!(email = %email_in, "login_failed_invalid_credentials");
-
         audit_log_best_effort(
             &state.db,
             Some(&email_in),
             "login",
             None,
-            ip,
+            &ip,
             "fail",
             json!({ "reason": "invalid_credentials" }),
         )
         .await;
-
         return Err(ApiError::unauthorized_msg("Email ou mot de passe invalide"));
     }
 
-    // JWT
     let token = create_jwt(&email_db)?;
 
-    // Cookie sécurisé : Secure si on est derrière HTTPS
-    // Cloudflare/Nginx doit envoyer X-Forwarded-Proto: https
-    let proto = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    let secure_flag = if proto.eq_ignore_ascii_case("https") {
-        " Secure;"
-    } else {
-        ""
-    };
-
-    let cookie = format!(
-        "jwt={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={};{}",
-        token,
-        60 * 60 * 24,
-        secure_flag
-    );
+    // ✅ UN SEUL système cookie : helpers
+    let cookie = build_jwt_cookie(&token, 60 * 60 * 24);
 
     let mut resp = Json(AuthResponse {
         status: "ok".to_string(),
@@ -384,42 +420,29 @@ pub async fn login_handler(
     })
     .into_response();
 
-    resp.headers_mut()
-        .insert(SET_COOKIE, cookie.parse().unwrap());
-    resp.headers_mut()
-        .insert(CACHE_CONTROL, "no-store".parse().unwrap());
+    resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
+    resp.headers_mut().insert(CACHE_CONTROL, "no-store".parse().unwrap());
 
-    audit_log_best_effort(
-        &state.db,
-        Some(&email_db),
-        "login",
-        None,
-        ip,
-        "ok",
-        json!({}),
-    )
-    .await;
-
+    audit_log_best_effort(&state.db, Some(&email_db), "login", None, &ip, "ok", json!({})).await;
     info!(email = %email_in, "login_ok");
+
     Ok(resp)
 }
 
 // ================================
 // HANDLER : /auth/logout (COOKIE)
 // ================================
-pub async fn logout_handler(State(state): State<AppState>) -> ApiResult<Response> {
-    let ip = "unknown";
+pub async fn logout_handler(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Response> {
+    let ip = client_ip(&headers);
 
-    // Expire le cookie (cohérent prod HTTPS)
-    let cookie = "jwt=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0; Secure";
-    let mut resp = Json(serde_json::json!({"status":"ok","message":"logout"})).into_response();
-    resp.headers_mut()
-        .insert(SET_COOKIE, cookie.parse().unwrap());
-    resp.headers_mut()
-        .insert(CACHE_CONTROL, "no-store".parse().unwrap());
+    // ✅ UN SEUL système cookie : helpers
+    let cookie = build_delete_cookie();
 
-    audit_log_best_effort(&state.db, None, "logout", None, ip, "ok", json!({})).await;
+    let mut resp = Json(json!({"status":"ok","message":"logout"})).into_response();
+    resp.headers_mut().insert(SET_COOKIE, cookie.parse().unwrap());
+    resp.headers_mut().insert(CACHE_CONTROL, "no-store".parse().unwrap());
 
+    audit_log_best_effort(&state.db, None, "logout", None, &ip, "ok", json!({})).await;
     Ok(resp)
 }
 
@@ -440,16 +463,111 @@ fn verify_password(hashed: &str, password: &str) -> bool {
 pub struct MeResponse {
     pub status: String,
     pub email: String,
+    pub is_admin: bool,
+
+    // quota/usage
+    pub quota_bytes: Option<i64>, // valeur DB (ex: 12 GB), ou null si non défini
+    pub used_bytes: i64,
+    pub max_bytes: i64,
+    pub used_percent: f64,
+    pub files_count: i64,
 }
 
-pub async fn me_handler(headers: HeaderMap) -> ApiResult<Json<MeResponse>> {
-    let email = get_user_from_headers(&headers)
-        .map_err(|_| ApiError::unauthorized_msg("Non authentifié"))?;
+pub async fn me_handler(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Json<MeResponse>> {
+    let ip = client_ip(&headers);
+
+    let email_raw =
+        get_user_from_headers(&headers).map_err(|_| ApiError::unauthorized_msg("Non authentifié"))?;
+    let email = email_raw.trim().to_lowercase();
+
+    // 1) user row: id + blocked + admin + quota
+    let row_user = sqlx::query(
+        r#"
+        SELECT
+            id,
+            COALESCE(is_blocked, 0) as is_blocked,
+            COALESCE(is_admin, 0)   as is_admin,
+            quota_bytes
+        FROM users
+        WHERE lower(email) = lower(?1)
+        LIMIT 1
+        "#,
+    )
+    .bind(&email)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| ApiError::unauthorized_msg("Non authentifié"))?;
+
+    let user_id: i64 = row_user.try_get("id").unwrap_or(0);
+    let is_blocked: i64 = row_user.try_get("is_blocked").unwrap_or(0);
+    if is_blocked == 1 {
+        warn!(%ip, owner=%email, "me_blocked_user");
+        return Err(ApiError::forbidden("account blocked"));
+    }
+
+    let is_admin_i64: i64 = row_user.try_get("is_admin").unwrap_or(0);
+    let is_admin = is_admin_i64 == 1;
+
+    // quota_bytes (peut être NULL)
+    let quota_bytes: Option<i64> = row_user.try_get("quota_bytes").ok().filter(|v| *v > 0);
+
+    // 2) stats via files.user_id
+    let row_stats = sqlx::query(
+        r#"
+        SELECT
+          COALESCE(SUM(size_bytes), 0) as used_bytes,
+          COUNT(*) as files_count
+        FROM files
+        WHERE user_id = ?1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| db_err("me stats", e))?;
+
+    let used_bytes: i64 = row_stats.try_get("used_bytes").unwrap_or(0);
+    let files_count: i64 = row_stats.try_get("files_count").unwrap_or(0);
+
+    // 3) max_bytes = quota DB si présent, sinon fallback env
+    let fallback: i64 = std::env::var("MAX_STORAGE_PER_USER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1024 * 1024 * 1024); // 1 GiB défaut
+
+    let max_bytes = quota_bytes.unwrap_or(fallback);
+
+    let used_percent = if max_bytes > 0 {
+        (used_bytes as f64 / max_bytes as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    info!(
+        %ip,
+        owner=%email,
+        user_id,
+        is_admin,
+        used_bytes,
+        max_bytes,
+        files_count,
+        "me_ok"
+    );
+
     Ok(Json(MeResponse {
         status: "ok".to_string(),
         email,
+        is_admin,
+        quota_bytes,
+        used_bytes,
+        max_bytes,
+        used_percent,
+        files_count,
     }))
 }
+
+
+
 
 // ======================
 // Tests (optionnel)

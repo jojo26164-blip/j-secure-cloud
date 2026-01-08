@@ -10,16 +10,14 @@ use crate::api::AppState;
 #[derive(Serialize)]
 pub struct MeResponse {
     pub email: String,
+    pub is_admin: bool,
     pub used_bytes: i64,
     pub max_bytes: i64,
     pub used_percent: f64,
     pub files_count: i64,
 }
 
-pub async fn me_handler(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-) -> ApiResult<Json<MeResponse>> {
+pub async fn me_handler(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Json<MeResponse>> {
     let ip = client_ip(&headers);
 
     let email_raw = match get_user_from_headers(&headers) {
@@ -30,14 +28,15 @@ pub async fn me_handler(
         }
     };
 
-    // Normalisation unique
     let email = email_raw.trim().to_lowercase();
 
-    // (Optionnel mais recommandé) : bloqué => forbidden
+    // User row: id + blocked + admin + quota
     let row_user = sqlx::query(
         r#"
         SELECT
+            id,
             COALESCE(is_blocked, 0) as is_blocked,
+            COALESCE(is_admin, 0)   as is_admin,
             quota_bytes
         FROM users
         WHERE lower(email) = lower(?1)
@@ -49,23 +48,28 @@ pub async fn me_handler(
     .await
     .map_err(|_| ApiError::unauthorized())?;
 
+    let user_id: i64 = row_user.try_get("id").unwrap_or(0);
+
     let is_blocked: i64 = row_user.try_get("is_blocked").unwrap_or(0);
     if is_blocked == 1 {
         warn!(%ip, owner=%email, "me_blocked_user");
         return Err(ApiError::forbidden("account blocked"));
     }
 
-    // used + files_count
+    let is_admin_i64: i64 = row_user.try_get("is_admin").unwrap_or(0);
+    let is_admin = is_admin_i64 == 1;
+
+    // ✅ Stats via files.user_id (compatible avec ton schéma)
     let (used_bytes, files_count) = sqlx::query(
         r#"
         SELECT
           COALESCE(SUM(size_bytes), 0) as used_bytes,
           COUNT(*) as files_count
         FROM files
-        WHERE owner = ?1
+        WHERE user_id = ?1
         "#,
     )
-    .bind(&email)
+    .bind(user_id)
     .fetch_one(&state.db)
     .await
     .map(|row| {
@@ -78,7 +82,7 @@ pub async fn me_handler(
         ApiError::internal()
     })?;
 
-    // max_bytes = quota_bytes si défini, sinon fallback env
+    // Quota
     let fallback: i64 = std::env::var("MAX_STORAGE_PER_USER_BYTES")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
@@ -94,10 +98,20 @@ pub async fn me_handler(
         0.0
     };
 
-    info!(%ip, owner=%email, used_bytes, max_bytes, files_count, "me_ok");
+    info!(
+        %ip,
+        owner=%email,
+        user_id,
+        is_admin,
+        used_bytes,
+        max_bytes,
+        files_count,
+        "me_ok"
+    );
 
     Ok(Json(MeResponse {
         email,
+        is_admin,
         used_bytes,
         max_bytes,
         used_percent,
@@ -106,10 +120,7 @@ pub async fn me_handler(
 }
 
 fn client_ip(headers: &HeaderMap) -> String {
-    if let Some(v) = headers
-        .get("cf-connecting-ip")
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(v) = headers.get("cf-connecting-ip").and_then(|v| v.to_str().ok()) {
         return v.trim().to_string();
     }
     if let Some(v) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {

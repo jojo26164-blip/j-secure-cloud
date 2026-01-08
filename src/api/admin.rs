@@ -1,6 +1,8 @@
 use axum::{
-    extract::{Path, State},
-    http::HeaderMap,
+    extract::{Request, Path, State},
+    http::{HeaderMap, StatusCode},
+    middleware::Next,
+    response::Response,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -42,7 +44,7 @@ fn is_admin_env(email: &str) -> bool {
         .any(|a| a == email_lc)
 }
 
-// ✅ Source de vérité: DB (users.is_admin)
+// ✅ Source de vérité : DB (users.is_admin)
 async fn is_admin_db(state: &AppState, email: &str) -> bool {
     let row = sqlx::query(
         r#"
@@ -62,42 +64,72 @@ async fn is_admin_db(state: &AppState, email: &str) -> bool {
     }
 }
 
+/// Audit admin : journald + DB (best-effort, ne casse jamais l’API)
 async fn audit_admin(
     state: &AppState,
     admin_email: &str,
     action: &str,
     target_email: Option<&str>,
     ip: &str,
-    meta: serde_json::Value,
+    outcome: &str, // ok | forbidden | error
+    details: serde_json::Value,
 ) {
-    // Best-effort: ne bloque pas l'API si la table n'existe pas
+    // Pré-serialisation (1 fois)
+    let details_json = details.to_string();
+
+    // 1) journald (toujours)
+    info!(
+        admin_email = %admin_email,
+        action = %action,
+        target_email = %target_email.unwrap_or(""),
+        ip = %ip,
+        outcome = %outcome,
+        details = %details_json,
+        "admin_audit"
+    );
+
+    // 2) DB (best-effort, ne casse jamais)
     let _ = sqlx::query(
         r#"
-        INSERT INTO admin_audit (admin_email, action, target_email, ip, meta_json)
-        VALUES (?1, ?2, ?3, ?4, ?5)
+        INSERT INTO admin_audit (admin_email, action, target_email, ip, outcome, details)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         "#,
     )
-    .bind(admin_email)
+    .bind(admin_email.trim().to_lowercase())
     .bind(action)
     .bind(target_email.map(|s| s.trim().to_lowercase()))
     .bind(ip)
-    .bind(meta.to_string())
+    .bind(outcome)
+    .bind(details_json)
     .execute(&state.db)
     .await;
 }
 
-// Vérif admin standard (DB d’abord, sinon ENV)
+/// Vérif admin standard (DB d’abord, sinon ENV)
 async fn require_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<String> {
     let email = get_user_from_headers(headers).map_err(|_| ApiError::unauthorized())?;
-
-    // Logs utiles
-    info!("ADMIN CHECK email={}", email);
-
     let ok = is_admin_db(state, &email).await || is_admin_env(&email);
     if !ok {
         return Err(ApiError::forbidden("admin only"));
     }
     Ok(email)
+}
+
+// -----------------------------
+// /admin/health
+// -----------------------------
+pub async fn health_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ip = client_ip(&headers);
+    let admin_email = require_admin(&state, &headers).await.map_err(|e| {
+        warn!(%ip, "admin_health_forbidden");
+        e
+    })?;
+
+    audit_admin(&state, &admin_email, "health", None, &ip, "ok", json!({})).await;
+    Ok(Json(json!({ "status": "ok" })))
 }
 
 // -----------------------------
@@ -143,7 +175,17 @@ pub async fn stats_handler(
                 ApiError::internal()
             })?;
 
-    info!(%ip, owner=%admin_email, users_count, files_count, total_bytes, "admin_stats_ok");
+    audit_admin(
+        &state,
+        &admin_email,
+        "stats",
+        None,
+        &ip,
+        "ok",
+        json!({ "users_count": users_count, "files_count": files_count, "total_bytes": total_bytes }),
+    )
+    .await;
+
     Ok(Json(AdminStatsResponse {
         users_count,
         files_count,
@@ -204,7 +246,17 @@ pub async fn users_handler(
         });
     }
 
-    info!(%ip, owner=%admin_email, users_count=out.len(), "admin_users_ok");
+    audit_admin(
+        &state,
+        &admin_email,
+        "list_users",
+        None,
+        &ip,
+        "ok",
+        json!({ "returned": out.len() }),
+    )
+    .await;
+
     Ok(Json(out))
 }
 
@@ -249,6 +301,16 @@ pub async fn block_user_handler(
     })?;
 
     if result.rows_affected() == 0 {
+        audit_admin(
+            &state,
+            &admin_email,
+            "block_user",
+            Some(&target),
+            &ip,
+            "error",
+            json!({"reason":"not_found"}),
+        )
+        .await;
         return Err(ApiError::not_found("user introuvable"));
     }
 
@@ -258,9 +320,11 @@ pub async fn block_user_handler(
         "block_user",
         Some(&target),
         &ip,
+        "ok",
         json!({}),
     )
     .await;
+
     Ok(Json(AdminOkResponse {
         status: "ok",
         message: format!("user bloqué: {target}"),
@@ -299,6 +363,16 @@ pub async fn unblock_user_handler(
     })?;
 
     if result.rows_affected() == 0 {
+        audit_admin(
+            &state,
+            &admin_email,
+            "unblock_user",
+            Some(&target),
+            &ip,
+            "error",
+            json!({"reason":"not_found"}),
+        )
+        .await;
         return Err(ApiError::not_found("user introuvable"));
     }
 
@@ -308,9 +382,11 @@ pub async fn unblock_user_handler(
         "unblock_user",
         Some(&target),
         &ip,
+        "ok",
         json!({}),
     )
     .await;
+
     Ok(Json(AdminOkResponse {
         status: "ok",
         message: format!("user débloqué: {target}"),
@@ -361,6 +437,16 @@ pub async fn set_quota_handler(
     })?;
 
     if result.rows_affected() == 0 {
+        audit_admin(
+            &state,
+            &admin_email,
+            "set_quota",
+            Some(&target),
+            &ip,
+            "error",
+            json!({"reason":"not_found"}),
+        )
+        .await;
         return Err(ApiError::not_found("user introuvable"));
     }
 
@@ -370,6 +456,7 @@ pub async fn set_quota_handler(
         "set_quota",
         Some(&target),
         &ip,
+        "ok",
         json!({ "quota_bytes": payload.quota_bytes }),
     )
     .await;
@@ -381,4 +468,89 @@ pub async fn set_quota_handler(
             None => format!("quota supprimé (NULL): {target}"),
         },
     }))
+}
+
+// -----------------------------
+// /admin/users/:email/delete  (suppression client)
+// -----------------------------
+pub async fn delete_user_handler(
+    headers: HeaderMap,
+    Path(email_target): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<AdminOkResponse>> {
+    let ip = client_ip(&headers);
+    let admin_email = require_admin(&state, &headers).await?;
+
+    let target = email_target.trim().to_lowercase();
+    if target.is_empty() {
+        return Err(ApiError::bad_request("email vide"));
+    }
+    if target == admin_email.trim().to_lowercase() {
+        return Err(ApiError::bad_request(
+            "tu ne peux pas te supprimer toi-même",
+        ));
+    }
+
+    // ⚠️ DB : ON DELETE CASCADE sur files(user_id) => supprime aussi les rows files du user
+    let res = sqlx::query(
+        r#"
+        DELETE FROM users
+        WHERE lower(email)=lower(?1)
+        "#,
+    )
+    .bind(&target)
+    .execute(&state.db)
+    .await
+    .map_err(|e| {
+        error!(%ip, owner=%admin_email, target=%target, error=%e, "admin_delete_user_db_error");
+        ApiError::internal()
+    })?;
+
+    if res.rows_affected() == 0 {
+        audit_admin(
+            &state,
+            &admin_email,
+            "delete_user",
+            Some(&target),
+            &ip,
+            "error",
+            json!({"reason":"not_found"}),
+        )
+        .await;
+        return Err(ApiError::not_found("user introuvable"));
+    }
+
+    // NOTE: ça supprime le user en DB, mais pas forcément les fichiers physiques sur disque.
+    // La suppression disque sera une étape séparée propre (pour éviter de casser).
+    audit_admin(
+        &state,
+        &admin_email,
+        "delete_user",
+        Some(&target),
+        &ip,
+        "ok",
+        json!({"note":"db_deleted"}),
+    )
+    .await;
+
+    Ok(Json(AdminOkResponse {
+        status: "ok",
+        message: format!("user supprimé (DB): {target}"),
+    }))
+}
+
+pub async fn admin_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Ici tu récupères les headers
+    let headers = req.headers();
+
+    // Vérif admin (réutilise ta logique require_admin)
+    let _admin_email = require_admin(&state, headers)
+        .await
+        .map_err(|_| StatusCode::FORBIDDEN)?;
+
+    Ok(next.run(req).await)
 }

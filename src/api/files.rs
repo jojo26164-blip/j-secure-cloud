@@ -9,10 +9,10 @@ use axum::{
     response::Response,
     Json,
 };
-
 use futures_util::{StreamExt, TryStreamExt};
 use nix::sys::statvfs::statvfs;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 use std::{
     path::{Path, PathBuf},
@@ -25,7 +25,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::io::ReaderStream;
-use tracing::{error, info, warn};
+use tracing::{error, warn, info};
 
 use crate::api::{
     audit::audit_log_best_effort,
@@ -38,9 +38,9 @@ use crate::api::{
 // ======================================================
 // DTOs
 // ======================================================
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct FileRow {
-    pub id: i64,
+    pub id: String, // ✅ file_id (stable, public API id)
     pub filename: String,
     pub size_bytes: i64,
     pub created_at: String,
@@ -56,7 +56,7 @@ pub struct ListFilesResponse {
 pub struct UploadResponse {
     pub status: String,
     pub message: String,
-    pub filename: String,
+    pub filename: String, // stored
     pub size_bytes: i64,
 }
 
@@ -123,9 +123,8 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Convertit "12345-fichier.pdf" => "fichier.pdf"
 fn display_filename(stored: &str) -> String {
-    // stored = "<nanos>-<safe_original>"
-    // on essaye de récupérer la partie après le premier '-'
     stored
         .splitn(2, '-')
         .nth(1)
@@ -162,18 +161,17 @@ fn guess_content_type(filename: &str) -> &'static str {
 // Limits (IMPORTANT)
 // ======================================================
 fn max_upload_bytes() -> u64 {
-    // ⚠️ Par défaut je mets 6GiB pour matcher ton router upload.
     std::env::var("MAX_UPLOAD_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(6_u64 * 1024 * 1024 * 1024)
+        .unwrap_or(6_u64 * 1024 * 1024 * 1024) // 6 GiB default
 }
 
 fn min_free_bytes() -> u64 {
     std::env::var("MIN_FREE_BYTES")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(2_u64 * 1024 * 1024 * 1024)
+        .unwrap_or(2_u64 * 1024 * 1024 * 1024) // 2 GiB default
 }
 
 fn is_forbidden_extension(filename: &str) -> bool {
@@ -187,7 +185,7 @@ fn audit_meta_err(msg: &str) -> serde_json::Value {
 }
 
 // ======================================================
-// DB helpers: blocked + quota + used
+// DB helpers: blocked + quota + used + user_id
 // ======================================================
 async fn ensure_not_blocked(db: &SqlitePool, email: &str) -> Result<(), ApiError> {
     let row = sqlx::query(
@@ -208,13 +206,28 @@ async fn ensure_not_blocked(db: &SqlitePool, email: &str) -> Result<(), ApiError
     Ok(())
 }
 
+async fn get_user_id(db: &SqlitePool, email: &str) -> Result<i64, ApiError> {
+    let row = sqlx::query(
+        r#"SELECT id
+           FROM users
+           WHERE lower(email) = lower(?1)
+           LIMIT 1"#,
+    )
+    .bind(email)
+    .fetch_one(db)
+    .await
+    .map_err(|_| ApiError::unauthorized())?;
+
+    Ok(row.try_get::<i64, _>("id").unwrap_or(0))
+}
+
 async fn get_user_quota_bytes(db: &SqlitePool, email: &str) -> Result<i64, ApiError> {
     let fallback: i64 = std::env::var("MAX_STORAGE_PER_USER_BYTES")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(1024 * 1024 * 1024); // 1GiB
 
-    let row_opt = sqlx::query(
+    let row_notice = sqlx::query(
         r#"SELECT quota_bytes
            FROM users
            WHERE lower(email) = lower(?1)
@@ -225,19 +238,21 @@ async fn get_user_quota_bytes(db: &SqlitePool, email: &str) -> Result<i64, ApiEr
     .await
     .map_err(|_| ApiError::internal())?;
 
-    if let Some(row) = row_opt {
-        let quota_db: Option<i64> = row.try_get("quota_bytes").ok();
-        let quota_db = quota_db.filter(|v| *v > 0);
-        Ok(quota_db.unwrap_or(fallback))
+    if let Some(row) = row_notice {
+        let q: Option<i64> = row.try_get("quota_bytes").ok();
+        let q = q.filter(|v| *v > 0);
+        Ok(q.unwrap_or(fallback))
     } else {
         Ok(fallback)
     }
 }
 
-async fn get_used_bytes(db: &SqlitePool, email: &str) -> Result<i64, ApiError> {
+/// NOTE: on compte tout (y compris corbeille).
+/// Si tu veux libérer quota au moment "delete => trash", change WHERE deleted_at IS NULL.
+async fn get_used_bytes(db: &SqlitePool, user_id: i64) -> Result<i64, ApiError> {
     let (used,): (i64,) =
-        sqlx::query_as(r#"SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE owner = ?1"#)
-            .bind(email)
+        sqlx::query_as(r#"SELECT COALESCE(SUM(size_bytes), 0) FROM files WHERE user_id = ?1"#)
+            .bind(user_id)
             .fetch_one(db)
             .await
             .map_err(|_| ApiError::internal())?;
@@ -262,8 +277,8 @@ async fn scan_file_with_clamav(path: &Path) -> Result<(), String> {
     let p = path
         .to_str()
         .ok_or_else(|| "invalid path (utf8)".to_string())?;
-
     let cmd = format!("SCAN {}\n", p);
+
     stream
         .write_all(cmd.as_bytes())
         .await
@@ -330,13 +345,12 @@ fn parse_range_header(range: &str, file_size: u64) -> Option<ByteRange> {
     if part.contains(',') {
         return None; // pas multi-range
     }
-
     let (a, b) = part.split_once('-')?;
     let a = a.trim();
     let b = b.trim();
 
-    // bytes=-500 (suffix)
     if a.is_empty() {
+        // suffix bytes: "-500"
         let suffix = b.parse::<u64>().ok()?;
         if suffix == 0 {
             return None;
@@ -350,11 +364,11 @@ fn parse_range_header(range: &str, file_size: u64) -> Option<ByteRange> {
         });
     }
 
-    // bytes=100- ou bytes=100-200
     let start = a.parse::<u64>().ok()?;
     if start >= file_size {
         return None;
     }
+
     let end_inclusive = if b.is_empty() {
         file_size - 1
     } else {
@@ -365,10 +379,7 @@ fn parse_range_header(range: &str, file_size: u64) -> Option<ByteRange> {
         end.min(file_size - 1)
     };
 
-    Some(ByteRange {
-        start,
-        end_inclusive,
-    })
+    Some(ByteRange { start, end_inclusive })
 }
 
 // ======================================================
@@ -400,15 +411,19 @@ pub async fn list_files_handler(
     };
 
     ensure_not_blocked(&state.db, &owner_email).await?;
+    let user_id = get_user_id(&state.db, &owner_email).await?;
 
     let rows = sqlx::query(
-        r#"SELECT id, filename, size_bytes, created_at
-           FROM files
-           WHERE owner = ?1
-           ORDER BY id DESC
-           LIMIT 500"#,
+        r#"
+        SELECT file_id, filename, size_bytes, created_at
+        FROM files
+        WHERE user_id = ?1
+          AND deleted_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT 500
+        "#,
     )
-    .bind(&owner_email)
+    .bind(user_id)
     .fetch_all(&state.db)
     .await
     .map_err(|_| ApiError::internal())?;
@@ -416,7 +431,7 @@ pub async fn list_files_handler(
     let mut files = Vec::with_capacity(rows.len());
     for r in rows {
         files.push(FileRow {
-            id: r.try_get("id").unwrap_or(0),
+            id: r.try_get("file_id").unwrap_or_default(),
             filename: r.try_get("filename").unwrap_or_default(),
             size_bytes: r.try_get("size_bytes").unwrap_or(0),
             created_at: r.try_get("created_at").unwrap_or_default(),
@@ -437,7 +452,7 @@ pub async fn upload_handler(
 ) -> ApiResult<Json<UploadResponse>> {
     let ip = client_ip(&headers);
 
-    // Rate limit
+    // Rate limit upload
     if let Err(e) = rate_limit_or_err(&headers, "upload", 30, Duration::from_secs(60)) {
         audit_log_best_effort(
             &state.db,
@@ -446,10 +461,7 @@ pub async fn upload_handler(
             None,
             &ip,
             "denied",
-            serde_json::json!({
-                "reason": "rate_limited",
-                "where": "upload",
-            }),
+            serde_json::json!({ "reason": "rate_limited", "where": "upload" }),
         )
         .await;
         return Err(e);
@@ -474,10 +486,10 @@ pub async fn upload_handler(
     };
 
     ensure_not_blocked(&state.db, &owner_email).await?;
-
+    let user_id = get_user_id(&state.db, &owner_email).await?;
     let max_upload = max_upload_bytes();
 
-    // Early reject via content-length
+    // Early reject via content-length (si présent)
     if let Some(cl) = headers.get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()) {
         if let Ok(size) = cl.parse::<u64>() {
             if size > max_upload {
@@ -492,7 +504,7 @@ pub async fn upload_handler(
                         "reason": "payload_too_large",
                         "content_length": size,
                         "max_upload": max_upload,
-                        "phase": "early_content_length",
+                        "phase": "early_content_length"
                     }),
                 )
                 .await;
@@ -503,14 +515,13 @@ pub async fn upload_handler(
 
     // Quota
     let max_user_storage = get_user_quota_bytes(&state.db, &owner_email).await?;
-    let used_bytes = get_used_bytes(&state.db, &owner_email).await?;
+    let used_bytes = get_used_bytes(&state.db, user_id).await?;
 
     // Prepare dirs
     let up_dir = uploads_dir();
     tokio::fs::create_dir_all(&up_dir)
         .await
         .map_err(|_| ApiError::internal())?;
-
     let t_dir = tmp_dir();
     tokio::fs::create_dir_all(&t_dir)
         .await
@@ -530,7 +541,7 @@ pub async fn upload_handler(
             serde_json::json!({
                 "reason": "insufficient_storage",
                 "free_bytes": free_bytes,
-                "min_free_bytes": min_free_bytes(),
+                "min_free_bytes": min_free_bytes()
             }),
         )
         .await;
@@ -542,6 +553,7 @@ pub async fn upload_handler(
     let mut temp_path: Option<PathBuf> = None;
     let mut final_name: Option<String> = None;
     let mut total_written: u64 = 0;
+    let mut sha256_hex: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -559,10 +571,7 @@ pub async fn upload_handler(
                     Some(&fname),
                     &ip,
                     "denied",
-                    serde_json::json!({
-                        "reason": "forbidden_extension",
-                        "filename": fname,
-                    }),
+                    serde_json::json!({ "reason": "forbidden_extension", "filename": fname }),
                 )
                 .await;
                 return Err(ApiError::file_refused());
@@ -580,11 +589,13 @@ pub async fn upload_handler(
                 .await
                 .map_err(|_| ApiError::internal())?;
 
+            let mut hasher = Sha256::new();
             let mut stream = field.into_stream();
+
             while let Some(chunk_res) = stream.next().await {
                 let chunk = chunk_res.map_err(|_| ApiError::bad_request("Erreur chunk upload"))?;
-                total_written = total_written.saturating_add(chunk.len() as u64);
 
+                total_written = total_written.saturating_add(chunk.len() as u64);
                 if total_written > max_upload {
                     let _ = tokio::fs::remove_file(&tmp).await;
                     audit_log_best_effort(
@@ -619,22 +630,23 @@ pub async fn upload_handler(
                             "used_bytes": used_bytes,
                             "written": total_written,
                             "projected_bytes": projected,
-                            "quota_bytes": max_user_storage,
+                            "quota_bytes": max_user_storage
                         }),
                     )
                     .await;
                     return Err(ApiError::quota_exceeded("quota de stockage dépassé"));
                 }
 
-                out.write_all(&chunk)
-                    .await
-                    .map_err(|_| ApiError::internal())?;
+                hasher.update(&chunk);
+                out.write_all(&chunk).await.map_err(|_| ApiError::internal())?;
             }
 
             out.flush().await.map_err(|_| ApiError::internal())?;
             drop(out);
 
-            // Optional clamav
+            sha256_hex = Some(format!("{:x}", hasher.finalize()));
+
+            // ClamAV (si activé)
             if let Err(reason) = scan_file_with_clamav(&tmp).await {
                 let _ = tokio::fs::remove_file(&tmp).await;
 
@@ -649,7 +661,7 @@ pub async fn upload_handler(
                         serde_json::json!({
                             "reason": "virus_detected",
                             "engine": "clamav",
-                            "clamav_resp": reason,
+                            "clamav_resp": reason
                         }),
                     )
                     .await;
@@ -666,7 +678,7 @@ pub async fn upload_handler(
                     serde_json::json!({
                         "reason": "clamav_error",
                         "engine": "clamav",
-                        "clamav_resp": reason,
+                        "clamav_resp": reason
                     }),
                 )
                 .await;
@@ -681,26 +693,37 @@ pub async fn upload_handler(
     let orig = original_name.ok_or_else(|| ApiError::bad_request("Champ 'file' manquant"))?;
     let tmp = temp_path.ok_or_else(ApiError::internal)?;
     let stored = final_name.ok_or_else(ApiError::internal)?;
+    let sha256_hex = sha256_hex.unwrap_or_else(|| "0".repeat(64));
+    let mime_type = guess_content_type(&orig).to_string();
 
+    // Move tmp -> final
     let final_path = uploads_dir().join(&stored);
     tokio::fs::rename(&tmp, &final_path)
         .await
         .map_err(|_| ApiError::internal())?;
 
     let size_bytes = total_written as i64;
+    let file_id = stored.clone(); // ✅ stable id
 
+    // DB insert
     if let Err(e) = sqlx::query(
-        r#"INSERT INTO files (filename, owner, size_bytes, created_at)
-           VALUES (?1, ?2, ?3, datetime('now'))"#,
+        r#"
+        INSERT INTO files (user_id, file_id, filename, size_bytes, sha256, mime_type)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
     )
+    .bind(user_id)
+    .bind(&file_id)
     .bind(&stored)
-    .bind(&owner_email)
     .bind(size_bytes)
+    .bind(&sha256_hex)
+    .bind(&mime_type)
     .execute(&state.db)
     .await
     {
-        error!(error=%e, "upload_db_insert_failed");
+        error!(error = %e, "upload_db_insert_failed");
         let _ = tokio::fs::remove_file(&final_path).await;
+
         audit_log_best_effort(
             &state.db,
             Some(&owner_email),
@@ -710,10 +733,11 @@ pub async fn upload_handler(
             "fail",
             serde_json::json!({
                 "reason": "db_insert_failed",
-                "stored": stored,
+                "stored": stored
             }),
         )
         .await;
+
         return Err(ApiError::internal());
     }
 
@@ -728,28 +752,30 @@ pub async fn upload_handler(
             "original": orig,
             "stored": stored,
             "size_bytes": size_bytes,
+            "sha256": sha256_hex,
+            "mime_type": mime_type
         }),
     )
     .await;
 
-    info!(owner=%owner_email, original=%orig, stored=%stored, size=%size_bytes, "upload_ok");
+    info!(owner=%owner_email, file_id=%file_id, size=%size_bytes, "upload_ok");
 
     Ok(Json(UploadResponse {
         status: "ok".to_string(),
         message: "Fichier uploadé".to_string(),
-        filename: stored,
+        filename: file_id,
         size_bytes,
     }))
 }
 
-
-//===========================================================//
+// ============================================================
 // GET /api/files/:id/download (streaming + Range + audit)
-//============================================================//
+// :id = file_id (String)
+// ============================================================
 pub async fn download_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(file_id): AxumPath<String>,
 ) -> ApiResult<Response> {
     let ip = client_ip(&headers);
 
@@ -761,7 +787,7 @@ pub async fn download_handler(
                 &state.db,
                 None,
                 "download",
-                None,
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 audit_meta_err(&msg),
@@ -777,7 +803,7 @@ pub async fn download_handler(
             &state.db,
             Some(&owner_email),
             "download",
-            Some(&format!("file_id={id}")),
+            Some(&format!("file_id={}", file_id)),
             &ip,
             "fail",
             serde_json::json!({ "reason": "blocked" }),
@@ -786,16 +812,19 @@ pub async fn download_handler(
         return Err(e);
     }
 
-    // 3) DB lookup
+    let requester_user_id = get_user_id(&state.db, &owner_email).await?;
+
+    // 3) DB lookup ✅ file_id + pas dans la corbeille
     let row = match sqlx::query(
         r#"
-        SELECT filename, owner, size_bytes
+        SELECT filename, user_id, size_bytes
         FROM files
-        WHERE id = ?1
+        WHERE file_id = ?1
+          AND deleted_at IS NULL
         LIMIT 1
         "#,
     )
-    .bind(id)
+    .bind(&file_id)
     .fetch_optional(&state.db)
     .await
     {
@@ -805,7 +834,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "db_not_found" }),
@@ -818,7 +847,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "db_error" }),
@@ -829,15 +858,15 @@ pub async fn download_handler(
     };
 
     let stored_name: String = row.try_get("filename").unwrap_or_default();
-    let file_owner: String = row.try_get("owner").unwrap_or_default();
+    let file_user_id: i64 = row.try_get("user_id").unwrap_or(0);
 
     // 4) Cross-user
-    if file_owner.trim().to_lowercase() != owner_email {
+    if file_user_id != requester_user_id {
         audit_log_best_effort(
             &state.db,
             Some(&owner_email),
             "download",
-            Some(&format!("file_id={id}")),
+            Some(&format!("file_id={}", file_id)),
             &ip,
             "fail",
             serde_json::json!({ "reason": "forbidden_cross_user" }),
@@ -855,7 +884,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "disk_missing", "stored": stored_name }),
@@ -864,6 +893,7 @@ pub async fn download_handler(
             return Err(ApiError::not_found("fichier manquant sur disque"));
         }
     };
+
     let file_size = meta.len();
 
     // Nom affiché
@@ -871,7 +901,7 @@ pub async fn download_handler(
     let ct = guess_content_type(&display);
     let cd = format!("attachment; filename=\"{}\"", display);
 
-    // 6) Open file (log si fail)
+    // 6) Open file
     let mut file = match File::open(&path).await {
         Ok(f) => f,
         Err(_) => {
@@ -879,7 +909,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 serde_json::json!({ "reason": "open_failed", "stored": stored_name }),
@@ -908,6 +938,7 @@ pub async fn download_handler(
             *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
 
             let cr = format!("bytes {}-{}/{}", start, end, file_size);
+
             resp.headers_mut()
                 .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             resp.headers_mut()
@@ -925,7 +956,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "ok",
                 serde_json::json!({
@@ -944,6 +975,7 @@ pub async fn download_handler(
         } else {
             let mut resp = Response::new(axum::body::Body::empty());
             *resp.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
+
             resp.headers_mut()
                 .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
             resp.headers_mut().insert(
@@ -959,7 +991,7 @@ pub async fn download_handler(
                 &state.db,
                 Some(&owner_email),
                 "download",
-                Some(&format!("file_id={id}")),
+                Some(&format!("file_id={}", file_id)),
                 &ip,
                 "fail",
                 serde_json::json!({
@@ -997,7 +1029,7 @@ pub async fn download_handler(
         &state.db,
         Some(&owner_email),
         "download",
-        Some(&format!("file_id={id}")),
+        Some(&format!("file_id={}", file_id)),
         &ip,
         "ok",
         serde_json::json!({
@@ -1012,71 +1044,219 @@ pub async fn download_handler(
     Ok(resp)
 }
 
-// DELETE /api/files/:id
+// ============================================================
+// DELETE /api/files/:id  => move to trash (soft delete)
+// :id = file_id (String)
+// ============================================================
+
+
 pub async fn delete_handler(
     headers: HeaderMap,
     State(state): State<AppState>,
-    AxumPath(id): AxumPath<i64>,
+    AxumPath(file_id): AxumPath<String>,
 ) -> ApiResult<Json<OkResponse>> {
     let ip = client_ip(&headers);
 
-    let owner_email = match get_user_from_headers(&headers) {
-        Ok(e) => e.trim().to_lowercase(),
-        Err(msg) => {
-            audit_log_best_effort(
-                &state.db,
-                None,
-                "delete",
-                None,
-                &ip,
-                "fail",
-                audit_meta_err(&msg),
-            )
-            .await;
-            return Err(ApiError::unauthorized());
-        }
-    };
+    let owner_email = get_user_from_headers(&headers)
+        .map_err(|_| ApiError::unauthorized())?
+        .trim()
+        .to_lowercase();
 
     ensure_not_blocked(&state.db, &owner_email).await?;
+    let user_id = get_user_id(&state.db, &owner_email).await?;
+
+    // 1️⃣ DELETE = mise en corbeille (source de vérité)
+    let res = sqlx::query(
+        r#"
+        UPDATE files
+        SET deleted_at = CAST(strftime('%s','now') AS INTEGER)
+        WHERE user_id = ?1
+          AND file_id = ?2
+          AND deleted_at IS NULL
+        "#,
+    )
+    .bind(user_id)
+    .bind(&file_id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| ApiError::internal())?;
+
+    // 2️⃣ Cas normal : on vient de le mettre en corbeille
+    if res.rows_affected() == 1 {
+        info!(owner=%owner_email, file_id=%file_id, "moved_to_trash");
+
+        return Ok(Json(OkResponse {
+            status: "ok",
+            message: "moved_to_trash".to_string(),
+        }));
+    }
+
+    // 3️⃣ Si aucune ligne modifiée → soit déjà en trash, soit inexistant
+    let exists = sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COUNT(*)
+        FROM files
+        WHERE user_id = ?1 AND file_id = ?2
+        "#,
+    )
+    .bind(user_id)
+    .bind(&file_id)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|_| ApiError::internal())?;
+
+    if exists == 0 {
+        return Err(ApiError::not_found("file not found"));
+    }
+
+    // 4️⃣ Déjà en corbeille → OK silencieux
+    Ok(Json(OkResponse {
+        status: "ok",
+        message: "already_in_trash".to_string(),
+    }))
+}
+
+
+// ============================================================
+// GET /api/files/trash
+// ============================================================
+pub async fn trash_list_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<FileRow>>> {
+    let owner_email = get_user_from_headers(&headers)
+        .map_err(|_| ApiError::unauthorized())?
+        .trim()
+        .to_lowercase();
+
+    ensure_not_blocked(&state.db, &owner_email).await?;
+    let user_id = get_user_id(&state.db, &owner_email).await?;
+
+    let rows = sqlx::query(
+        r#"
+        SELECT file_id AS id, filename, size_bytes, created_at
+        FROM files
+        WHERE user_id = ?1 AND deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC
+        LIMIT 500
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|_| ApiError::internal())?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        out.push(FileRow {
+            id: r.try_get("id").unwrap_or_else(|_| "".to_string()),
+            filename: r.try_get("filename").unwrap_or_default(),
+            size_bytes: r.try_get("size_bytes").unwrap_or(0),
+            created_at: r.try_get("created_at").unwrap_or_default(),
+        });
+    }
+
+    Ok(Json(out))
+}
+
+// ============================================================
+// POST /api/files/:id/restore
+// :id = file_id (String)
+// ============================================================
+pub async fn restore_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(file_id): AxumPath<String>,
+) -> ApiResult<Json<OkResponse>> {
+    let owner_email = get_user_from_headers(&headers)
+        .map_err(|_| ApiError::unauthorized())?
+        .trim()
+        .to_lowercase();
+
+    ensure_not_blocked(&state.db, &owner_email).await?;
+    let user_id = get_user_id(&state.db, &owner_email).await?;
+
+    let r = sqlx::query(
+        r#"
+        UPDATE files
+        SET deleted_at = NULL
+        WHERE file_id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL
+        "#,
+    )
+    .bind(&file_id)
+    .bind(user_id)
+    .execute(&state.db)
+    .await
+    .map_err(|_| ApiError::internal())?;
+
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found("file not found (not in trash)"));
+    }
+
+    Ok(Json(OkResponse {
+        status: "ok",
+        message: "restored".to_string(),
+    }))
+}
+
+// ============================================================
+// DELETE /api/files/:id/purge
+// :id = file_id (String)
+// ============================================================
+pub async fn purge_handler(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    AxumPath(file_id): AxumPath<String>,
+) -> ApiResult<Json<OkResponse>> {
+    let owner_email = get_user_from_headers(&headers)
+        .map_err(|_| ApiError::unauthorized())?
+        .trim()
+        .to_lowercase();
+
+    ensure_not_blocked(&state.db, &owner_email).await?;
+    let user_id = get_user_id(&state.db, &owner_email).await?;
 
     let row = sqlx::query(
-        r#"SELECT filename
-           FROM files
-           WHERE id = ?1 AND owner = ?2
-           LIMIT 1"#,
+        r#"
+        SELECT filename
+        FROM files
+        WHERE file_id = ?1 AND user_id = ?2 AND deleted_at IS NOT NULL
+        LIMIT 1
+        "#,
     )
-    .bind(id)
-    .bind(&owner_email)
+    .bind(&file_id)
+    .bind(user_id)
     .fetch_optional(&state.db)
     .await
     .map_err(|_| ApiError::internal())?;
 
     let Some(row) = row else {
-        return Err(ApiError::not_found("file not found"));
+        return Err(ApiError::not_found("file not found (not in trash)"));
     };
 
     let filename: String = row.try_get("filename").unwrap_or_default();
     let path = uploads_dir().join(&filename);
 
-    // disk then db
+    // Disk first (best effort), then DB delete
     let disk_res = tokio::fs::remove_file(&path).await;
-    let result = sqlx::query(r#"DELETE FROM files WHERE id = ?1 AND owner = ?2"#)
-        .bind(id)
-        .bind(&owner_email)
+
+    let r = sqlx::query(r#"DELETE FROM files WHERE file_id = ?1 AND user_id = ?2"#)
+        .bind(&file_id)
+        .bind(user_id)
         .execute(&state.db)
         .await
         .map_err(|_| ApiError::internal())?;
 
-    if result.rows_affected() == 0 {
+    if r.rows_affected() == 0 {
         return Err(ApiError::not_found("file not found"));
     }
 
     if let Err(e) = disk_res {
-        warn!(error=%e, "delete_disk_failed_but_db_removed");
+        warn!(error=%e, "purge_disk_failed_but_db_removed");
     }
 
     Ok(Json(OkResponse {
         status: "ok",
-        message: format!("deleted: {filename}"),
+        message: format!("purged: {filename}"),
     }))
 }
